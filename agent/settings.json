@@ -1,0 +1,17 @@
+{
+  "compaction": {
+    "enabled": true
+  },
+  "defaultModel": "glm-5.3-flash:cloud",
+  "defaultProvider": "ollama",
+  "editorPaddingX": 2,
+  "lastChangelogVersion": "0.84.4",
+  "outputPad": 1,
+  "packages": [
+    "npm:pi-submarine@0.2.0",
+    "npm:@heyhuynhgiabuu/pi-pretty@0.6.26",
+    "npm:@heyhuynhgiabuu/pi-diff@0.8.1",
+    { "source": "npm:@ollama/pi-web-search@0.0.5", "extensions": [] }
+  ],
+  "theme": "dark"
+}

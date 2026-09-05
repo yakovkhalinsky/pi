@@ -1,0 +1,5 @@
+#!/bin/sh
+# Executes pi on its own bundled Node at ~/.pi/node/bin/node regardless of
+# which `node` is first on PATH — so the shell's default `node` (whatever
+# version manager provides it) is left untouched.
+exec "$HOME/.pi/node/bin/node" "$HOME/.pi/node/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" "$@"

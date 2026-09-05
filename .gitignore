@@ -1,0 +1,15 @@
+# Secrets — never commit
+agent/auth.json
+agent/models-store.json
+agent/models.json
+# Ephemeral / sensitive (conversation transcripts)
+agent/sessions/
+# Runtime / re-downloadable (recreated by install.sh)
+node/
+# pi-pretty FFF search index (runtime cache, rebuilt per project on session start)
+agent/pi-pretty/
+# npm cache (already self-ignoring via agent/npm/.gitignore; keep .gitignore + package.json only)
+agent/npm/node_modules/
+agent/npm/package-lock.json
+# macOS
+.DS_Store

@@ -1,0 +1,20 @@
+{
+  "name": "pi-extensions",
+  "private": true,
+  "dependencies": {
+    "@heyhuynhgiabuu/pi-diff": "0.8.1",
+    "@heyhuynhgiabuu/pi-pretty": "0.6.26",
+    "@ollama/pi-web-search": "0.0.5",
+    "pi-submarine": "0.2.0"
+  },
+  "overrides": {
+    "@heyhuynhgiabuu/pi-diff": {
+      "diff": "^8.0.3"
+    }
+  },
+  "allowScripts": {
+    "@google/genai": true,
+    "esbuild": true,
+    "protobufjs": true
+  }
+}
