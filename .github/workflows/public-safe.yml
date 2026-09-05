@@ -1,0 +1,16 @@
+name: public-safe
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for secrets / private info
+        run: sh scripts/check-public-safe.sh --all

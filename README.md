@@ -32,6 +32,20 @@ configuration on another macOS/Linux machine from a clean clone.
 
 See `.gitignore` for the exact ignore rules.
 
+## Keeping this repo public-safe
+
+This repo is public — every commit is world-visible. Before committing, run
+`sh scripts/check-public-safe.sh` (staged files) or with `--all` (whole
+tree); it blocks secret file names, credential values, personal absolute
+paths, and identifier leaks. It also runs in CI on every push, and locally
+as the pre-commit hook once you've run:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`AGENTS.md` carries the same rules for agent sessions working in this repo.
+
 ## Recreate on a new machine
 
 ```sh

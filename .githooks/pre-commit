@@ -1,0 +1,4 @@
+#!/bin/sh
+# Pre-commit guard: block accidental secret/private info in this PUBLIC repo.
+# Install once per clone:  git config core.hooksPath .githooks
+"$(git rev-parse --show-toplevel)/scripts/check-public-safe.sh"
