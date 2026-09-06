@@ -114,3 +114,5 @@ At the start of its turn, call `eden_recall` with the task/goal summary to surfa
 ## Parent assistant continuation cue
 
 After this role subagent returns, the parent assistant spawns the chosen next role via the pi `subagent` tool with the goal context and hand-off record ID. Pause and ask the user only if the latest Eden-memory record is `blocked`, `pending_authorisation`, or an `escalation_record`.
+
+Every `subagent`/`subagent_resume` spawn must carry user-visible narration text in the same assistant message (never a silent, text-less tool call); a resume after a failed child run must name the dead child, the error, and the continuation it is issuing.

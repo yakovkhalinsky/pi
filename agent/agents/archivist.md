@@ -110,3 +110,5 @@ Forgetting (deleting) durable records is the most destructive cleanup operation.
 ## Parent assistant continuation cue
 
 After this role subagent returns, immediately continue goal `${GOAL_ID}` by spawning the `router` subagent or invoking `/team-continue ${GOAL_ID}`. Pause and ask the user only if the latest Eden-memory record is `blocked`, `pending_authorisation`, or an `escalation_record`.
+
+Every `subagent`/`subagent_resume` spawn must carry user-visible narration text in the same assistant message (never a silent, text-less tool call); a resume after a failed child run must name the dead child, the error, and the continuation it is issuing.
