@@ -814,9 +814,15 @@ type GoalState = "active" | "blocked" | "pending_authorisation" | "continueable"
  * Classify a goal's state from the latest record's type/status/stage,
  * mirroring the SKILL router lifecycle rules (not the stage string alone).
  * `hasArchival` = the goal has at least one archival_record. A goal is closed
- * only on an archival_record (or an archivist hand-off that follows one):
- * every ATP hand_off_record uses stage hand_off_or_closure, so mid-flight
- * hand-offs (researcher→builder, router→role, …) must stay continueable.
+ * only on an archival_record (or a hand-off following one that carries the
+ * closure stage): every ATP hand_off_record uses stage hand_off_or_closure,
+ * so mid-flight hand-offs (researcher→builder, router→role, …) must stay
+ * continueable.
+ *
+ * Post-closure bookkeeping does not reopen a closed goal (SKILL "stale
+ * closures"): only a new action_record, verdict, or dispatch supersedes an
+ * archival_record. Router run_logs / closure hand-offs written AFTER archival
+ * at stage hand_off_or_closure are closure confirmation, not new work.
  */
 function classifyState(rec: ParsedRecord, hasArchival = false): GoalState {
 	const status = rec.status.toLowerCase();
@@ -832,7 +838,8 @@ function classifyState(rec: ParsedRecord, hasArchival = false): GoalState {
 		return "continueable";
 	}
 	if (type === "archival_record") return "closed";
-	if (type === "hand_off_record" && rec.owner.toLowerCase() === "archivist" && hasArchival) return "closed";
+	if (type === "hand_off_record" && hasArchival && stage.includes("hand_off_or_closure")) return "closed";
+	if (hasArchival && type === "run_log" && stage.includes("hand_off_or_closure")) return "closed";
 	if (type === "verdict") {
 		if (status.includes("green")) return "active"; // -> archivist
 		if (status.includes("red")) return "continueable"; // -> rework

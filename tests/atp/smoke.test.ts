@@ -80,7 +80,8 @@ describe("M1 smoke: harness seams", () => {
 		assert.equal(mod.classifyState(rec({ recordType: "authorisation_record", status: "approved" })), "continueable");
 		assert.equal(mod.classifyState(rec({ recordType: "authorisation_record", status: "deferred" })), "pending_authorisation");
 		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "archivist" }), false), "continueable");
-		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "archivist" }), true), "closed");
+		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "archivist", stage: "hand_off_or_closure" }), true), "closed");
+		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "router", stage: "routing_and_assignment" }), true), "continueable");
 		// F5a: a parked action recorded as pending_authorisation never reads active
 		assert.equal(
 			mod.classifyState(rec({ recordType: "pending_authorisation", status: "pending_authorisation", stage: "action" })),

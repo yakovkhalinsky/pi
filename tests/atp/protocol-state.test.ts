@@ -46,8 +46,19 @@ describe("A1: classifyState mirrors the SKILL.md router lifecycle table", () => 
 	it("A1-7: archivist hand-off WITHOUT archival → continueable (mid-flight, not closure)", () => {
 		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "archivist", stage: "hand_off_or_closure" }), false), "continueable");
 	});
-	it("A1-8: hand-off by any other role → continueable", () => {
-		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "researcher", stage: "hand_off_or_closure" }), true), "continueable");
+	it("A1-8: any-role hand-off at the closure stage AFTER archival → closed (closure confirmation)", () => {
+		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "researcher", stage: "hand_off_or_closure" }), true), "closed");
+		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "router", stage: "hand_off_or_closure" }), true), "closed");
+	});
+	it("A1-8b: hand-off at a WORK stage after archival → continueable (rework routing, not closure)", () => {
+		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "router", stage: "routing_and_assignment" }), true), "continueable");
+		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "verifier", stage: "verification" }), true), "continueable");
+	});
+	it("A1-8c: post-closure router run_log at the closure stage → closed (atp-setup-env-hazard shape)", () => {
+		assert.equal(mod.classifyState(rec({ recordType: "run_log", owner: "router", stage: "hand_off_or_closure", status: "completed" }), true), "closed");
+	});
+	it("A1-8d: post-closure run_log at a work stage → continueable (conservative)", () => {
+		assert.equal(mod.classifyState(rec({ recordType: "run_log", owner: "builder", stage: "action", status: "in_progress" }), true), "continueable");
 	});
 	it("A1-9: verdict green → active (→ archivist)", () => {
 		assert.equal(mod.classifyState(rec({ recordType: "verdict", status: "green", owner: "verifier", stage: "verification" })), "active");
@@ -199,6 +210,28 @@ describe("A2: summarizeGoals — latest-record selection, filters, in-flight han
 		]);
 		assert.equal(summaries[0].goalId, goalA, "newest goal first");
 		assert.equal(summaries[0].recordCount, 1);
+	});
+
+	it("A2-14: post-closure router bookkeeping renders closed, not continueable (real-goal regression shapes)", () => {
+		// atp-merge-setup-env-hazard shape: archival → archivist hand-off → router CLOSURE run_log
+		const [mergeGoal] = mod.summarizeGoals([
+			mk({ recordType: "run_log", stage: "hand_off_or_closure", owner: "router", status: "completed", createdAt: FIXTURE_BASE_TS + 4 }),
+			mk({ recordType: "hand_off_record", stage: "hand_off_or_closure", owner: "archivist", createdAt: FIXTURE_BASE_TS + 3 }),
+			mk({ recordType: "archival_record", stage: "recording_and_archival", owner: "archivist", status: "completed", createdAt: FIXTURE_BASE_TS + 2 }),
+			mk({ recordType: "goal_record", stage: "goal_receipt", owner: "dispatcher", createdAt: FIXTURE_BASE_TS + 1 }),
+		]);
+		assert.equal(mergeGoal.state, "closed", "router closure run_log must not reopen an archived goal");
+		// atp-workspace-cleanup shape: archival → … → router run_log → router closure hand-off
+		const [cleanupGoal] = mod.summarizeGoals([
+			mk({ recordType: "hand_off_record", stage: "hand_off_or_closure", owner: "router", createdAt: FIXTURE_BASE_TS + 6 }),
+			mk({ recordType: "run_log", stage: "hand_off_or_closure", owner: "router", status: "completed", createdAt: FIXTURE_BASE_TS + 5 }),
+			mk({ recordType: "hand_off_record", stage: "hand_off_or_closure", owner: "archivist", createdAt: FIXTURE_BASE_TS + 4 }),
+			mk({ recordType: "archival_record", stage: "recording_and_archival", owner: "archivist", status: "completed", createdAt: FIXTURE_BASE_TS + 3 }),
+			mk({ recordType: "verdict", stage: "verification", owner: "verifier", status: "green", createdAt: FIXTURE_BASE_TS + 2 }),
+			mk({ recordType: "goal_record", stage: "goal_receipt", owner: "dispatcher", createdAt: FIXTURE_BASE_TS + 1 }),
+		]);
+		assert.equal(cleanupGoal.state, "closed", "router closure hand-off must not reopen an archived goal");
+		assert.equal(cleanupGoal.stageLabel, "Closure");
 	});
 });
 
