@@ -2340,3 +2340,74 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
+// ---------------------------------------------------------------------------
+// Test-only exports — exercised by the repo's test harness (tests/TEST-SCOPE.md,
+// tests/atp/). Behavior-neutral: pi consumes only the default export above.
+// ---------------------------------------------------------------------------
+export type {
+	EdenConfig,
+	ParsedRecord,
+	DbRow,
+	GoalState,
+	GoalSummary,
+	StrandedPending,
+	SubagentRow,
+	SteerRecord,
+};
+export {
+	// record parsing / protocol state machine (scope A)
+	parseMetadata,
+	parseRecord,
+	classifyState,
+	summarizeGoals,
+	isPendingItem,
+	latestPendingForGoal,
+	findStrandedPending,
+	sqlEscape,
+	fetchGoals,
+	// rendering helpers (scope C)
+	stateTag,
+	stageBadge,
+	ownerBadge,
+	fmtTime,
+	relTime,
+	fmtStored,
+	clip,
+	statusColor,
+	summarizeMetaValue,
+	stripIdentity,
+	unwrapJsonBlob,
+	humanizeBody,
+	shortId,
+	prettifyGoalId,
+	extractGoalTitle,
+	displayGoal,
+	bodyOf,
+	humanize,
+	padCol,
+	col,
+	goalCol,
+	boardRow,
+	boardHeader,
+	emptyBoard,
+	needsYouRows,
+	// widget / poller (scope C7)
+	readNewBytes,
+	tailJsonl,
+	describeSessionEntry,
+	pollManifest,
+	pollChildSessions,
+	fmtElapsed,
+	sortedSubagentRows,
+	formatSubagentRow,
+	themelessSteerLine,
+	renderWidget,
+	// steer delivery (scope C8)
+	fetchSteers,
+	writeSteer,
+	consumePendingSteers,
+	// config / db resolution (scope B)
+	edenConfig,
+	resolveDbPath,
+	dbHint,
+};

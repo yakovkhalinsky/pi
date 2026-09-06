@@ -20,6 +20,7 @@
 #   AGENTS.md                       agent rules (public-safe hygiene, docs sync)
 #   bin/pi                          wrapper shim
 #   agent/agents/  prompts/  extensions/  skills/   portable config
+#   tests/                          ATP test suite (repo-only; never installed)
 #   agent/settings.json             safe prefs (no secrets); packages pinned
 #   agent/pi-pretty.json            pi-pretty extension config (safe prefs)
 #   agent/models.example.json       sanitized provider template (apiKey: "")

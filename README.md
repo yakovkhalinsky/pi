@@ -14,6 +14,7 @@ configuration on another macOS/Linux machine from a clean clone.
 | `agent/prompts/` | Team prompt templates (team-charter, team-continue, team-escalate, team-handoff, team-status, team). |
 | `agent/extensions/` | Extension source (agentic-team-protocol, web-search-pretty). |
 | `agent/skills/` | Skills (agentic-team-protocol: README, CHARTER, SKILL, eden.sh). |
+| `tests/` | ATP test suite — repo-only, never installed into `~/.pi` (see "Running the tests"). |
 | `agent/settings.json` | Safe prefs only (theme, defaultModel, defaultProvider, compaction, packages) — **no secrets**. |
 | `agent/pi-pretty.json` | pi-pretty extension config (icons, tool rendering opts) — safe prefs. |
 | `agent/models.example.json` | Sanitized provider/model template with `apiKey: ""`. `install.sh` copies it to `~/.pi/agent/models.json` only if the target doesn't already exist. |
@@ -50,6 +51,18 @@ git config core.hooksPath .githooks
 ```
 
 `AGENTS.md` carries the same rules for agent sessions working in this repo.
+
+## Running the tests
+
+The repo carries a test suite for the agentic-team-protocol extension and its
+eden.sh wrapper (`tests/atp/`, scope in `tests/TEST-SCOPE.md`). It is
+dev-only: `install.sh` never copies it into `~/.pi/`.
+
+```sh
+tests/setup.sh                 # one-time: link runtime deps into node_modules/
+node --test tests/atp/*.test.ts            # offline tiers (~7s)
+ATP_E2E=1 node --test tests/atp/e2e-real-cli.test.ts  # real-CLI e2e (scratch DBs)
+```
 
 ## Recreate on a new machine
 

@@ -13,3 +13,5 @@ agent/npm/node_modules/
 agent/npm/package-lock.json
 # macOS
 .DS_Store
+# ATP test deps (dev-only symlinks, recreated by tests/setup.sh)
+node_modules/
