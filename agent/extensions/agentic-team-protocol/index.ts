@@ -820,9 +820,12 @@ type GoalState = "active" | "blocked" | "pending_authorisation" | "continueable"
  * continueable.
  *
  * Post-closure bookkeeping does not reopen a closed goal (SKILL "stale
- * closures"): only a new action_record, verdict, or dispatch supersedes an
- * archival_record. Router run_logs / closure hand-offs written AFTER archival
- * at stage hand_off_or_closure are closure confirmation, not new work.
+ * closures" + router table "archival_record → closed, report only"): only a
+ * new action_record, verdict, dispatch, escalation, authorisation, or
+ * cleanup record supersedes an archival_record. Post-archival run_logs and
+ * hand-off records are closure-time noise at ANY stage — except an
+ * in-flight run_log at a work stage, which stays continueable as the F6a
+ * interrupted-work signal.
  */
 function classifyState(rec: ParsedRecord, hasArchival = false): GoalState {
 	const status = rec.status.toLowerCase();
@@ -838,8 +841,15 @@ function classifyState(rec: ParsedRecord, hasArchival = false): GoalState {
 		return "continueable";
 	}
 	if (type === "archival_record") return "closed";
-	if (type === "hand_off_record" && hasArchival && stage.includes("hand_off_or_closure")) return "closed";
-	if (hasArchival && type === "run_log" && stage.includes("hand_off_or_closure")) return "closed";
+	if (hasArchival && type === "hand_off_record") return "closed";
+	if (hasArchival && type === "run_log") {
+		// An in-flight run_log at a work stage after closure means a role
+		// genuinely resumed mid-turn (F6a interrupted work) — keep it open.
+		// Everything else (closure reporting, stale routing logs) is noise.
+		const inFlight = status.includes("in_progress") || status.includes("active");
+		const workStage = !stage.includes("hand_off_or_closure") && !stage.includes("archival") && !stage.includes("archive");
+		if (!inFlight || !workStage) return "closed";
+	}
 	if (type === "verdict") {
 		if (status.includes("green")) return "active"; // -> archivist
 		if (status.includes("red")) return "continueable"; // -> rework

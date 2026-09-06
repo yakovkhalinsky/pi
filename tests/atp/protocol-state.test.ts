@@ -50,15 +50,22 @@ describe("A1: classifyState mirrors the SKILL.md router lifecycle table", () => 
 		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "researcher", stage: "hand_off_or_closure" }), true), "closed");
 		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "router", stage: "hand_off_or_closure" }), true), "closed");
 	});
-	it("A1-8b: hand-off at a WORK stage after archival → continueable (rework routing, not closure)", () => {
-		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "router", stage: "routing_and_assignment" }), true), "continueable");
-		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "verifier", stage: "verification" }), true), "continueable");
+	it("A1-8b: post-archival hand-offs at ANY stage are bookkeeping → closed; real rework reopens via dispatch", () => {
+		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "router", stage: "routing_and_assignment" }), true), "closed");
+		assert.equal(mod.classifyState(rec({ recordType: "hand_off_record", owner: "verifier", stage: "verification" }), true), "closed");
+		// lifecycle-driving records still reopen: dispatch = router rework routing
+		assert.equal(mod.classifyState(rec({ recordType: "dispatch_instruction", owner: "dispatcher", stage: "routing_and_assignment", status: "in_progress" }), true), "continueable");
 	});
 	it("A1-8c: post-closure router run_log at the closure stage → closed (atp-setup-env-hazard shape)", () => {
 		assert.equal(mod.classifyState(rec({ recordType: "run_log", owner: "router", stage: "hand_off_or_closure", status: "completed" }), true), "closed");
 	});
-	it("A1-8d: post-closure run_log at a work stage → continueable (conservative)", () => {
+	it("A1-8d: in-flight run_log at a work stage post-archival → continueable (F6a interrupted-work signal)", () => {
 		assert.equal(mod.classifyState(rec({ recordType: "run_log", owner: "builder", stage: "action", status: "in_progress" }), true), "continueable");
+		assert.equal(mod.classifyState(rec({ recordType: "run_log", owner: "builder", stage: "action", status: "active" }), true), "continueable");
+	});
+	it("A1-8e: completed post-archival run_log at a work stage → closed (goal-55863d86 shape)", () => {
+		assert.equal(mod.classifyState(rec({ recordType: "run_log", owner: "router", stage: "routing_and_assignment", status: "completed" }), true), "closed");
+		assert.equal(mod.classifyState(rec({ recordType: "run_log", owner: "builder", stage: "build", status: "" }), true), "closed");
 	});
 	it("A1-9: verdict green → active (→ archivist)", () => {
 		assert.equal(mod.classifyState(rec({ recordType: "verdict", status: "green", owner: "verifier", stage: "verification" })), "active");
@@ -232,6 +239,16 @@ describe("A2: summarizeGoals — latest-record selection, filters, in-flight han
 		]);
 		assert.equal(cleanupGoal.state, "closed", "router closure hand-off must not reopen an archived goal");
 		assert.equal(cleanupGoal.stageLabel, "Closure");
+		// goal-55863d86 shape (old-era workspace agents): archival → next-morning router
+		// run_log + hand-off at routing_and_assignment, nothing after → closed
+		const [oldEraGoal] = mod.summarizeGoals([
+			mk({ recordType: "hand_off_record", stage: "routing_and_assignment", owner: "router", status: "active", createdAt: FIXTURE_BASE_TS + 5 }),
+			mk({ recordType: "run_log", stage: "routing_and_assignment", owner: "router", status: "active", createdAt: FIXTURE_BASE_TS + 4 }),
+			mk({ recordType: "archival_record", stage: "archive", owner: "archivist", status: "completed", createdAt: FIXTURE_BASE_TS + 3 }),
+			mk({ recordType: "verdict", stage: "verify", owner: "verifier", status: "green", createdAt: FIXTURE_BASE_TS + 2 }),
+			mk({ recordType: "goal_record", stage: "goal_receipt", owner: "dispatcher", createdAt: FIXTURE_BASE_TS + 1 }),
+		]);
+		assert.equal(oldEraGoal.state, "closed", "post-archival routing bookkeeping must not reopen an archived goal");
 	});
 });
 
