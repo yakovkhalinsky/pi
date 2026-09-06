@@ -37,8 +37,25 @@
  *     steers), steer displays show the full displayGoal() id, and /steer
  *     refuses ambiguous goal-id prefixes instead of taking the first match.
  *
+ * Closed-goal removal (2026-09-06):
+ *   Closed goals are terminal state — they no longer render as board rows on
+ *   the live widget, /team-board (default view), or team_status (default
+ *   view); a dim count line replaces them so live goals, running agents,
+ *   needs-you, and steers stay visible. The full record set is still fetched
+ *   (stranded-pending detection and per-goal filters are unaffected), and an
+ *   explicit `include_closed` / `all` opt-in shows the closed rows again.
+ *   For durable removal, team_purge (tool) / /team-purge (command) forgets a
+ *   CLOSED goal's records under the F1 cleanup discipline: goals with
+ *   unresolved pending/blocked items are refused (closure disposition rule),
+ *   every record id is per-id lookup-verified against the goal before
+ *   forgetting, a purge-audit cleanup_record is stored first (without a
+ *   goal_id metadata key or a "Goal:" identity line — either would
+ *   resurrect the goal as a board row), and forgotten ids are soft-deleted
+ *   (recoverable via DB snapshot) rather than hard-erased.
+ *
  * Command:
  *   - /team-board  — full-width bordered goal board (esc to close)
+ *   - /team-purge  — preview/remove closed goals from Eden-memory (F1-safe)
  *
  * Lifecycle UX:
  *   On every `subagent` tool_result, a compact goal board is refreshed as a
@@ -575,6 +592,10 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 	const theme = ctx.ui.theme;
 	const { goals, records } = await fetchGoals(pi, ctx, undefined, {});
 	const steers = await fetchSteers(pi, ctx);
+	// Closed goals are terminal state — they stop hogging board rows (the
+	// needs-you list below still surfaces any stranded pending items on them).
+	const openGoals = goals.filter((g) => g.state !== "closed");
+	const closedCount = goals.length - openGoals.length;
 
 	// Only running runs render: terminal state lives on the board's goal rows,
 	// so lingering "✓ completed" agent rows under the board are pure duplication.
@@ -584,9 +605,9 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 	const lines: string[] = [theme.fg("accent", theme.bold(" Goal Board"))];
 	let budget = 6; // total live-agent activity lines on the widget
 	let rendered = 0;
-	if (goals.length > 0) {
+	if (openGoals.length > 0) {
 		lines.push(boardHeader(theme, true));
-		for (const g of goals) {
+		for (const g of openGoals) {
 			lines.push(boardRow(theme, g, true));
 			const runs = attached.get(g.goalId) ?? [];
 			for (const r of runs) {
@@ -614,6 +635,11 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 	const hidden = running.length - rendered;
 	if (hidden > 0) lines.push(theme.fg("dim", ` …+${hidden} more running agent${hidden === 1 ? "" : "s"}`));
 
+	if (closedCount > 0) {
+		if (openGoals.length > 0 || loose.length > 0) lines.push("");
+		lines.push(theme.fg("dim", ` …${closedCount} closed goal${closedCount === 1 ? "" : "s"} hidden (team-board all · team-purge to remove)`));
+	}
+
 	const stranded = findStrandedPending(records, goals);
 	const needsYou = needsYouRows(theme, goals, stranded);
 	if (needsYou.length > 0) {
@@ -631,7 +657,7 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 		}
 	}
 
-	if (goals.length === 0 && running.length === 0 && steers.length === 0) {
+	if (openGoals.length === 0 && running.length === 0 && steers.length === 0 && needsYou.length === 0) {
 		ctx.ui.setWidget("atp-board", undefined);
 		ctx.ui.setStatus("atp", undefined);
 		return;
@@ -1135,6 +1161,283 @@ async function fetchGoals(
 }
 
 // ---------------------------------------------------------------------------
+// Closed-goal removal (team_purge tool + /team-purge command)
+// ---------------------------------------------------------------------------
+
+interface PurgeTargetInfo {
+	goalId: string;
+	title: string;
+	recordCount: number;
+	recordIds: string[];
+	archivalRecordId: string;
+}
+
+interface PurgeSkip {
+	goalId: string;
+	reason: string;
+}
+
+interface PurgeOutcome {
+	goalId: string;
+	title: string;
+	forgottenIds: string[];
+	retainedIds: string[];
+	auditRecordId: string;
+}
+
+interface PurgeResult {
+	ok: boolean;
+	error?: string;
+	dryRun: boolean;
+	targets: PurgeTargetInfo[];
+	skipped: PurgeSkip[];
+	outcomes: PurgeOutcome[];
+}
+
+/**
+ * Durable removal of CLOSED goals from Eden-memory (F1-safe).
+ *
+ * Safety rails, in order:
+ *   1. Only goals whose state is `closed` (latest archival record) are
+ *      purgeable; anything else is skipped with the reason.
+ *   2. Goals with unresolved pending_authorisation/blocked records are
+ *      refused (closure disposition rule) — decide via team_decide first.
+ *   3. Every record id is enumerated by the goal-scoped metadata scan, then
+ *      per-id lookup-verified against the goal (F1 point 3) — anything that
+ *      fails verification is retained, never forgotten.
+ *   4. A purge-audit cleanup_record is stored BEFORE the forgets (F1 point 4:
+ *      evidence survives the forget) and edited with the actual outcome
+ *      after. It intentionally carries NO goal_id metadata key and NO
+ *      "Goal: …" identity line — either would resurrect the purged goal as
+ *      a board row (fetchGoals selects on metadata.goal_id; parseRecord
+ *      falls back to the content identity line).
+ *   5. forget is a soft delete (deleted_at) — records stay recoverable from
+ *      the DB until a real prune; the audit record is always retained.
+ */
+async function purgeClosedGoals(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext | undefined,
+	signal: AbortSignal | undefined,
+	opts: { goalId?: string; all?: boolean; dryRun?: boolean; workspace?: string },
+): Promise<PurgeResult> {
+	const empty: PurgeResult = { ok: false, dryRun: !!opts.dryRun, targets: [], skipped: [], outcomes: [] };
+	await resolveDbPath(pi, ctx);
+	const cfg = edenConfig(ctx, opts.workspace);
+	if (!cfg.orgId) return { ...empty, error: missingOrgMessage() };
+	const { goals, records } = await fetchGoals(pi, ctx, signal, opts.workspace ? { workspace: opts.workspace } : {});
+
+	const strandedByGoal = new Map<string, StrandedPending>();
+	for (const s of findStrandedPending(records, goals)) strandedByGoal.set(s.goalId, s);
+
+	let selected: GoalSummary[] = [];
+	if (opts.goalId && opts.goalId.trim()) {
+		const q = opts.goalId.trim().toLowerCase();
+		const matches = goals.filter(
+			(g) => g.goalId.toLowerCase().startsWith(q) || displayGoal(g.goalId).toLowerCase().startsWith(q),
+		);
+		if (matches.length === 0) {
+			return { ...empty, error: `No goal matching '${opts.goalId}' in workspace ${cfg.workspaceId} — team_status lists current goals.` };
+		}
+		if (matches.length > 1) {
+			return {
+				...empty,
+				error: `'${opts.goalId}' matches multiple goals (${matches.map((g) => displayGoal(g.goalId)).join(", ")}) — pass a longer id prefix.`,
+			};
+		}
+		selected = matches;
+	} else if (opts.all) {
+		selected = goals.filter((g) => g.state === "closed");
+	} else if (opts.dryRun) {
+		// Bare dry-run previews every closed goal (same as bare /team-purge).
+		selected = goals.filter((g) => g.state === "closed");
+	} else {
+		return { ...empty, error: "Pass goal_id (a closed goal), all: true, or dry_run: true (previews all closed goals)." };
+	}
+
+	// Split into purgeable targets and skips (not closed / unresolved pending).
+	const targets: GoalSummary[] = [];
+	const skipped: PurgeSkip[] = [];
+	for (const g of selected) {
+		const s = strandedByGoal.get(g.goalId);
+		if (s) {
+			skipped.push({
+				goalId: g.goalId,
+				reason: `unresolved pending/blocked record ${shortId(s.recordId, 8)} — decide via team_decide first (closure disposition rule)`,
+			});
+		} else if (g.state !== "closed") {
+			skipped.push({ goalId: g.goalId, reason: `goal state is ${g.state}, not closed` });
+		} else {
+			targets.push(g);
+		}
+	}
+
+	const infoFor = (g: GoalSummary): PurgeTargetInfo => {
+		const recs = records.filter((r) => r.goalId === g.goalId);
+		return {
+			goalId: g.goalId,
+			title: displayGoal(g.goalId),
+			recordCount: recs.length,
+			recordIds: recs.map((r) => r.id),
+			archivalRecordId: recs.find((r) => r.recordType === "archival_record")?.id ?? "",
+		};
+	};
+
+	if (opts.dryRun) {
+		return { ok: true, dryRun: true, targets: targets.map(infoFor), skipped, outcomes: [] };
+	}
+
+	const outcomes: PurgeOutcome[] = [];
+	for (const g of targets) {
+		const info = infoFor(g);
+		// Per-id verification before any forget (F1 point 3).
+		const verified: string[] = [];
+		const retained: string[] = [];
+		for (const id of info.recordIds) {
+			try {
+				const res = await pi.exec(
+					cfg.bin,
+					[
+						"--db", cfg.db,
+						"lookup",
+						"--user-id", cfg.userId,
+						"--org-id", cfg.orgId,
+						"--workspace-id", cfg.workspaceId,
+						"--id", id,
+					],
+					{ signal, timeout: 15000 },
+				);
+				const parsed = JSON.parse(res.stdout || "{}") as { found?: boolean; metadata?: Record<string, unknown>; content?: string };
+				const mdGoal = (parsed.metadata?.goal_id as string | undefined) ?? "";
+				const contentGoal = (parsed.content ?? "").match(IDENTITY_RE)?.[1] ?? "";
+				if (parsed.found === true && (mdGoal === g.goalId || (!mdGoal && contentGoal === g.goalId))) verified.push(id);
+				else retained.push(id);
+			} catch {
+				retained.push(id);
+			}
+		}
+
+		// Purge-audit record BEFORE the forgets (F1 point 4).
+		const auditMetadata = {
+			stage: "cleanup",
+			owner_role: "archivist",
+			record_type: "cleanup_record",
+			status: "in_progress",
+			protocol: "agentic-team-protocol",
+			purged_goal_id: g.goalId,
+			purged_record_ids: verified,
+			retained_record_ids: retained,
+		};
+		const planContent = [
+			`PURGE AUDIT — goal ${g.goalId} removed from workspace ${cfg.workspaceId}`,
+			`Plan: forget ${verified.length} verified record(s)${retained.length ? `; retain ${retained.length} unverified` : ""} (every id lookup-verified: metadata.goal_id match).`,
+			info.archivalRecordId ? `Final archival record: ${info.archivalRecordId}` : "",
+			`Purged by team_purge at ${new Date().toISOString()}`,
+		]
+			.filter(Boolean)
+			.join("\n");
+		const storeRes = await pi.exec(
+			cfg.bin,
+			[
+				"--db", cfg.db,
+				"remember",
+				"--agent-id", "archivist",
+				"--user-id", cfg.userId,
+				"--org-id", cfg.orgId,
+				"--workspace-id", cfg.workspaceId,
+				"--content", planContent,
+				"--metadata", JSON.stringify(auditMetadata),
+			],
+			{ signal, timeout: 30000 },
+		);
+		const auditRecordId = storeRes.code === 0 ? (storeRes.stdout.match(/"id"\s*:\s*"([^"]+)"/)?.[1] ?? "") : "";
+
+		// Per-id forget (soft delete — recoverable until a real prune).
+		const forgotten: string[] = [];
+		const failed: string[] = [];
+		for (const id of verified) {
+			try {
+				const res = await pi.exec(cfg.bin, ["--db", cfg.db, "forget", "--id", id], { signal, timeout: 15000 });
+				if (res.code === 0) forgotten.push(id);
+				else failed.push(id);
+			} catch {
+				failed.push(id);
+			}
+		}
+
+		// Fold the actual outcome back into the audit record (best effort; the
+		// pre-forget plan audit survives even if this edit fails).
+		if (auditRecordId) {
+			const finalContent = [
+				`PURGE AUDIT — goal ${g.goalId} removed from workspace ${cfg.workspaceId}`,
+				`Forgot ${forgotten.length} record(s); ${failed.length} forget failure(s); ${retained.length} retained unverified.`,
+				forgotten.length ? `Forgotten: ${forgotten.join(" ")}` : "",
+				failed.length ? `Forget failed (retained): ${failed.join(" ")}` : "",
+				retained.length ? `Retained (lookup-unverified): ${retained.join(" ")}` : "",
+				info.archivalRecordId ? `Final archival record: ${info.archivalRecordId}` : "",
+				`Purged by team_purge at ${new Date().toISOString()}`,
+			]
+				.filter(Boolean)
+				.join("\n");
+			try {
+				await pi.exec(
+					cfg.bin,
+					[
+						"--db", cfg.db,
+						"edit",
+						"--id", auditRecordId,
+						"--user-id", cfg.userId,
+						"--org-id", cfg.orgId,
+						"--workspace-id", cfg.workspaceId,
+						"--content", finalContent,
+						"--metadata",
+						JSON.stringify({
+							...auditMetadata,
+							status: failed.length === 0 ? "completed" : "partial",
+							forgotten_ids: forgotten,
+							failed_ids: failed,
+						}),
+					],
+					{ signal, timeout: 30000 },
+				);
+			} catch {
+				/* plan audit still stands */
+			}
+		}
+
+		outcomes.push({
+			goalId: g.goalId,
+			title: info.title,
+			forgottenIds: forgotten,
+			retainedIds: [...retained, ...failed],
+			auditRecordId,
+		});
+	}
+
+	return { ok: true, dryRun: false, targets: targets.map(infoFor), skipped, outcomes };
+}
+
+/** Shared plain-text summary for the team_purge tool + /team-purge command. */
+function purgeSummaryLines(res: PurgeResult): string[] {
+	if (res.error) return [res.error];
+	const lines: string[] = [];
+	for (const t of res.targets) {
+		lines.push(
+			`  ${res.dryRun ? "○ would purge" : "✓ purged"} ${t.title} — ${t.recordCount} record(s)${t.archivalRecordId ? ` · archival rec ${shortId(t.archivalRecordId, 8)}` : ""}`,
+		);
+	}
+	for (const s of res.skipped) {
+		lines.push(`  ⚠ skipped ${displayGoal(s.goalId)} — ${s.reason}`);
+	}
+	for (const o of res.outcomes) {
+		lines.push(
+			`      forgot ${o.forgottenIds.length}${o.retainedIds.length ? ` · retained ${o.retainedIds.length}` : ""}${o.auditRecordId ? ` · audit ${shortId(o.auditRecordId, 8)}` : ""}`,
+		);
+	}
+	if (res.targets.length === 0 && res.skipped.length === 0) lines.push("  (no closed goals found)");
+	return lines;
+}
+
+// ---------------------------------------------------------------------------
 // Themed rendering helpers
 // ---------------------------------------------------------------------------
 
@@ -1413,16 +1716,22 @@ function boardHeader(theme: Theme, compact: boolean): string {
 	return `${state}  ${goal}  ${stage}  ${owner}  ${rec}  ${when}  ${counts}`;
 }
 
-function emptyBoard(theme: Theme, filter?: { goalId?: string; role?: string }): string[] {
+function emptyBoard(theme: Theme, filter?: { goalId?: string; role?: string }, closedCount = 0): string[] {
 	if (filter?.goalId || filter?.role) {
 		const what = filter.goalId ? `goal ${displayGoal(filter.goalId)}` : `role ${filter.role}`;
 		return [theme.fg("dim", `No team records found for ${what} in Eden-memory (check the workspace line above).`)];
 	}
-	return [
-		theme.fg("dim", "No active goals found in Eden-memory."),
-		"",
-		theme.fg("muted", "Start one with ") + theme.fg("accent", "/team <goal>"),
-	];
+	return closedCount > 0
+		? [
+				theme.fg("dim", `No open goals found in Eden-memory — ${closedCount} closed goal${closedCount === 1 ? "" : "s"} hidden.`),
+				"",
+				theme.fg("muted", "/team-board all to show them · ") + theme.fg("accent", "/team-purge") + theme.fg("muted", " to remove"),
+			]
+		: [
+				theme.fg("dim", "No active goals found in Eden-memory."),
+				"",
+				theme.fg("muted", "Start one with ") + theme.fg("accent", "/team <goal>"),
+			];
 }
 
 /**
@@ -1466,6 +1775,12 @@ const TeamStatusParams = Type.Object({
 	role: Type.Optional(
 		Type.String({
 			description: "Filter by team role: dispatcher, researcher, builder, runtime, verifier, archivist, router",
+		}),
+	),
+	include_closed: Type.Optional(
+		Type.Boolean({
+			description:
+				"Include closed goals in the table (default false: closed goals are summarized in a count line so terminal rows don't push live state out of view). An explicit goal_id filter always includes that goal regardless of state.",
 		}),
 	),
 	workspace: Type.Optional(
@@ -1561,7 +1876,7 @@ export default function (pi: ExtensionAPI) {
 		name: "team_status",
 		label: "Team Status",
 		description:
-			"List active Agentic Team Protocol goals from Eden-memory with current stage, owner role, latest record id, and state (active/blocked/pending_authorisation/continueable/closed). Reads indexed metadata, scoped to the current org/workspace (optional workspace param overrides; the output states the queried workspace). Renders a themed, aligned table. Goals pending_authorisation/blocked are additionally listed as NEEDS HUMAN DECISION items with the question extracted from the latest record, and pending/blocked records stranded on CLOSED goals are found by scanning each goal's records and listed the same way — surface these to the user.",
+			"List Agentic Team Protocol goals from Eden-memory with current stage, owner role, latest record id, and state (active/blocked/pending_authorisation/continueable/closed). OPEN goals render as the table; CLOSED goals are terminal state and are summarized in a hidden-count line by default (pass include_closed: true to show them; an explicit goal_id filter always includes its goal regardless of state). Reads indexed metadata, scoped to the current org/workspace (optional workspace param overrides; the output states the queried workspace). Goals pending_authorisation/blocked are additionally listed as NEEDS HUMAN DECISION items with the question extracted from the latest record, and pending/blocked records stranded on CLOSED goals are found by scanning each goal's records and listed the same way — surface these to the user.",
 		promptSnippet: "Show active team goals, stages, owners, and state from Eden-memory",
 		promptGuidelines: [
 			"Use team_status (not raw bash + eden.sh) when the user asks for /team-status or a goal/role status report.",
@@ -1582,8 +1897,17 @@ export default function (pi: ExtensionAPI) {
 			// latest-record state machine.
 			const stranded = findStrandedPending(records, goals);
 
+			// Closed goals are terminal state: default views summarize them in a
+			// count line instead of full rows so live state stays in view. An
+			// explicit goal_id filter always includes its goal (role rehydration),
+			// and include_closed opts back into the full table.
+			const closedCount = goals.filter((g) => g.state === "closed").length;
+			const includeClosed = params.include_closed === true || Boolean(filter.goalId);
+			const shownGoals = includeClosed ? goals : goals.filter((g) => g.state !== "closed");
+			const hiddenClosed = goals.length - shownGoals.length;
+
 			const pending = goals.filter((g) => g.state === "pending_authorisation" || g.state === "blocked");
-			const goalLines = goals.map(
+			const goalLines = shownGoals.map(
 				(g) =>
 					`${displayGoal(g.goalId)} | ${g.stageLabel} | ${g.nextOwner ? `${g.owner} → ${g.nextOwner}` : g.owner} | ${g.state} | rec=${shortId(g.latestRecordId)} | ${g.recordCount} records`,
 			);
@@ -1595,20 +1919,31 @@ export default function (pi: ExtensionAPI) {
 				(s) =>
 					`NEEDS HUMAN DECISION (goal closed, ${humanize(s.recordType)}): ${displayGoal(s.goalId)} — ${s.question}. rec=${shortId(s.recordId)}. team_decide goal_id="${s.goalId}" still works on closed goals; the router handles continuation.`,
 			);
+			const hiddenClosedLines =
+				hiddenClosed > 0
+					? [
+							`${hiddenClosed} closed goal(s) hidden — include_closed: true (or goal_id) to show them; team_purge removes closed goals durably.`,
+						]
+					: [];
 
 			const ws = `workspace ${cfg.workspaceId} (${cfg.workspaceSource})${dbHint(cfg)}`;
 			const summaryText = dbError
 				? `Eden-memory db error (${ws}): ${dbError}`
 				: goals.length === 0 && stranded.length === 0
 					? `No active goals found in Eden-memory (${ws}).`
-					: [`Queried ${ws}.`, "", ...decisionLines, ...strandedLines, "", ...goalLines].join("\n");
+					: closedCount > 0 && shownGoals.length === 0
+						? [`No open goals (${ws}). ${closedCount} closed goal(s) hidden — team_purge removes closed goals durably.`, "", ...decisionLines, ...strandedLines].join("\n")
+						: [`Queried ${ws}.`, "", ...decisionLines, ...strandedLines, ...hiddenClosedLines, "", ...goalLines].join("\n");
 
 			return {
 				content: [{ type: "text", text: summaryText }],
 				details: {
-					goals,
+					goals: shownGoals,
+					closedCount,
+					hiddenClosed,
+					includeClosed,
 					stranded,
-					count: goals.length,
+					count: shownGoals.length,
 					filter,
 					dbError,
 					workspace: cfg.workspaceId,
@@ -1626,10 +1961,11 @@ export default function (pi: ExtensionAPI) {
 
 		renderResult(result, _opts, theme, _context) {
 			const details = result.details as
-				| { goals?: GoalSummary[]; stranded?: StrandedPending[]; dbError?: string; filter?: { goalId?: string; role?: string }; workspace?: string; workspaceSource?: string }
+				| { goals?: GoalSummary[]; stranded?: StrandedPending[]; dbError?: string; filter?: { goalId?: string; role?: string }; closedCount?: number; hiddenClosed?: number; includeClosed?: boolean; workspace?: string; workspaceSource?: string }
 				| undefined;
 			const goals = details?.goals ?? [];
 			const stranded = details?.stranded ?? [];
+			const hiddenClosed = details?.hiddenClosed ?? 0;
 
 			const container = new Container();
 			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
@@ -1646,19 +1982,26 @@ export default function (pi: ExtensionAPI) {
 				return container;
 			}
 			if (goals.length === 0) {
-				for (const l of emptyBoard(theme, details?.filter)) container.addChild(new Text(l, 0, 0));
+				for (const l of emptyBoard(theme, details?.filter, hiddenClosed)) container.addChild(new Text(l, 0, 0));
 				return container;
 			}
 
 			container.addChild(new Text(boardHeader(theme, false), 0, 0));
 			for (const g of goals) container.addChild(new Text(boardRow(theme, g, false), 0, 0));
+			if (hiddenClosed > 0) {
+				container.addChild(
+					new Text(theme.fg("dim", ` …+${hiddenClosed} closed goal${hiddenClosed === 1 ? "" : "s"} hidden (include_closed: true · team-purge to remove)`), 0, 0),
+				);
+			}
 			const needsYou = needsYouRows(theme, goals, stranded);
 			if (needsYou.length > 0) {
 				container.addChild(new Spacer(1));
 				for (const l of needsYou) container.addChild(new Text(l, 0, 0));
 				container.addChild(new Spacer(1));
 			}
-			container.addChild(new Text(theme.fg("dim", `${goals.length} goal(s)`), 0, 0));
+			container.addChild(
+				new Text(theme.fg("dim", `${goals.length} goal(s)${hiddenClosed > 0 ? ` (+${hiddenClosed} closed hidden)` : ""}`), 0, 0),
+			);
 			return container;
 		},
 	});
@@ -2279,6 +2622,123 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// --- team_purge ---------------------------------------------------------
+	// Durable removal of closed goals (F1-safe): closed goals accumulate in
+	// Eden-memory forever otherwise, cluttering the board and recall long
+	// after their audit value has been extracted. Removal is never automatic.
+	pi.registerTool({
+		name: "team_purge",
+		label: "Team Purge",
+		description:
+			"Durable removal of CLOSED Agentic Team Protocol goals from Eden-memory so they stop occupying the board and recall. Refuses goals that are not closed or that carry unresolved pending_authorisation/blocked records (closure disposition rule — decide via team_decide first). dry_run: true previews without touching memory. The actual purge per-id lookup-verifies every record against the goal before forgetting (F1 cleanup discipline), stores a purge-audit cleanup_record (plan before, outcome after), then forgets each verified id — records are soft-deleted (recoverable from the DB until pruned), and the audit record itself is retained. Pass goal_id (unambiguous prefix ok) for one goal or all: true for every purgeable closed goal in the workspace.",
+		promptGuidelines: [
+			"Use team_purge only when the user asks to remove/purge closed goals. Prefer dry_run: true first when unsure, and report forgotten/retained counts and skips. Never purge a goal with an unresolved pending/blocked record.",
+		],
+		parameters: Type.Object({
+			goal_id: Type.Optional(Type.String({ description: "Goal id (or unambiguous prefix) of a CLOSED goal to purge" })),
+			all: Type.Optional(
+				Type.Boolean({ description: "Purge every closed goal in the workspace that has no unresolved pending/blocked records" }),
+			),
+			dry_run: Type.Optional(Type.Boolean({ description: "Preview what would be purged without touching memory (default false)" })),
+			workspace: Type.Optional(
+				Type.String({
+					description: "Eden-memory workspace (optional). Resolution: explicit param > env ATP_WORKSPACE_ID > session default.",
+				}),
+			),
+		}),
+
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const res = await purgeClosedGoals(pi, ctx, signal, {
+				goalId: params.goal_id,
+				all: params.all === true,
+				dryRun: params.dry_run === true,
+				workspace: params.workspace,
+			});
+			const cfg = edenConfig(ctx, params.workspace);
+			const header = res.error ? `team_purge failed on workspace ${cfg.workspaceId}: ${res.error}` : `team_purge on workspace ${cfg.workspaceId}:`;
+			const text = res.error ? header : [header, ...purgeSummaryLines(res)].join("\n");
+			void renderWidget(pi, ctx);
+			return {
+				content: [{ type: "text", text }],
+				details: res,
+			};
+		},
+
+		renderCall(args, theme, _context) {
+			let text = theme.fg("toolTitle", theme.bold("team_purge"));
+			if (args.goal_id) text += ` ${theme.fg("accent", args.goal_id)}`;
+			else if (args.all) text += ` ${theme.fg("accent", "all")}`;
+			if (args.dry_run) text += ` ${theme.fg("muted", "(dry run)")}`;
+			return new Text(text, 0, 0);
+		},
+
+		renderResult(result, _opts, theme, _context) {
+			const details = result.details as PurgeResult | undefined;
+			if (!details) return new Text(theme.fg("dim", "team_purge"), 0, 0);
+			if (details.error) return new Text(theme.fg("error", `team_purge error: ${details.error}`), 0, 0);
+			const c = new Container();
+			c.addChild(
+				new Text(
+					theme.fg(details.dryRun ? "warning" : "success", theme.bold(` ${details.dryRun ? "⏳ dry run — nothing touched" : "✓ purge complete"}`)),
+					0,
+					0,
+				),
+			);
+			for (const t of details.targets) {
+				c.addChild(
+					new Text(
+						theme.fg(details.dryRun ? "warning" : "success", details.dryRun ? "  ○ would purge" : "  ✓ purged") +
+							"  " +
+							theme.fg("text", theme.bold(t.title)) +
+							theme.fg("dim", `  ${t.recordCount} record(s)${t.archivalRecordId ? ` · archival rec ${shortId(t.archivalRecordId, 8)}` : ""}`),
+						0,
+						0,
+					),
+				);
+			}
+			for (const s of details.skipped) {
+				c.addChild(
+					new Text(theme.fg("warning", "  ⚠ skipped ") + theme.fg("text", theme.bold(displayGoal(s.goalId))) + theme.fg("muted", ` — ${s.reason}`), 0, 0),
+				);
+			}
+			for (const o of details.outcomes) {
+				c.addChild(
+					new Text(
+						theme.fg("dim", `      forgot ${o.forgottenIds.length}${o.retainedIds.length ? ` · retained ${o.retainedIds.length}` : ""}${o.auditRecordId ? ` · audit ${shortId(o.auditRecordId, 8)}` : ""}`),
+						0,
+						0,
+					),
+				);
+			}
+			if (details.targets.length === 0 && details.skipped.length === 0) {
+				c.addChild(new Text(theme.fg("dim", "  (no closed goals found)"), 0, 0));
+			}
+			return c;
+		},
+	});
+
+	// --- /team-purge command ------------------------------------------------
+	pi.registerCommand("team-purge", {
+		description: "Preview/remove closed goals from Eden-memory: /team-purge [goal-id|all] (bare = dry-run preview)",
+		handler: async (args, ctx) => {
+			const a = args.trim();
+			const isAll = a === "all" || a === "--all";
+			const res = await purgeClosedGoals(pi, ctx, undefined, {
+				goalId: !isAll && a ? a : undefined,
+				all: isAll,
+				dryRun: a === "",
+			});
+			const lines = res.error ? [`team_purge: ${res.error}`] : purgeSummaryLines(res);
+			const header = res.error ? undefined : res.dryRun ? "team_purge (dry run — nothing touched):" : "team_purge:";
+			for (const l of [...(header ? [header] : []), ...lines]) {
+				ctx.ui.notify(l, res.error ? "error" : "info");
+			}
+			if (res.dryRun && res.ok) {
+				ctx.ui.notify("Run /team-purge <goal-id> or /team-purge all to actually remove them.", "info");
+			}
+		},
+	});
+
 	// --- /team-board command ------------------------------------------------
 	pi.registerCommand("team-board", {
 		description: "Show a full-width bordered team goal board (esc to close)",
@@ -2289,7 +2749,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const filter: { goalId?: string; role?: string } = {};
-			const a = args.trim();
+			// `all` / `closed` opts into the full board (closed rows included);
+			// the default view shows open goals only, with a hidden-count line.
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			const includeClosed = tokens.includes("all") || tokens.includes("closed");
+			const a = tokens.filter((t) => t !== "all" && t !== "closed").join(" ");
 			if (a) {
 				if (/^[0-9a-f-]{8,}$/i.test(a) || a.startsWith("atp-")) filter.goalId = a;
 				else filter.role = a;
@@ -2297,6 +2761,9 @@ export default function (pi: ExtensionAPI) {
 			const { goals, records, dbError } = await fetchGoals(pi, ctx, undefined, filter);
 			const stranded = findStrandedPending(records, goals);
 			const cfg = edenConfig(ctx);
+			const closedCount = goals.filter((g) => g.state === "closed").length;
+			const shownGoals = includeClosed || filter.goalId ? goals : goals.filter((g) => g.state !== "closed");
+			const hiddenClosed = goals.length - shownGoals.length;
 
 			await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
 				const c = new Container();
@@ -2307,12 +2774,15 @@ export default function (pi: ExtensionAPI) {
 
 				if (dbError) {
 					c.addChild(new Text(theme.fg("error", `eden-memory db error: ${dbError}`), 0, 0));
-				} else if (goals.length === 0) {
-					for (const l of emptyBoard(theme, filter)) c.addChild(new Text(l, 0, 0));
+				} else if (shownGoals.length === 0) {
+					for (const l of emptyBoard(theme, filter, closedCount)) c.addChild(new Text(l, 0, 0));
 				} else {
 					c.addChild(new Text(boardHeader(theme, true), 0, 0));
-					for (const g of goals) c.addChild(new Text(boardRow(theme, g, true), 0, 0));
-					const needsYou = needsYouRows(theme, goals, stranded);
+					for (const g of shownGoals) c.addChild(new Text(boardRow(theme, g, true), 0, 0));
+					if (hiddenClosed > 0) {
+						c.addChild(new Text(theme.fg("dim", ` …+${hiddenClosed} closed goal${hiddenClosed === 1 ? "" : "s"} hidden (team-board all · team-purge to remove)`), 0, 0));
+					}
+					const needsYou = needsYouRows(theme, shownGoals, stranded);
 					if (needsYou.length > 0) {
 						c.addChild(new Spacer(1));
 						for (const l of needsYou) c.addChild(new Text(l, 0, 0));
@@ -2439,6 +2909,10 @@ export type {
 	StrandedPending,
 	SubagentRow,
 	SteerRecord,
+	PurgeTargetInfo,
+	PurgeSkip,
+	PurgeOutcome,
+	PurgeResult,
 };
 export {
 	// record parsing / protocol state machine (scope A)
@@ -2494,6 +2968,9 @@ export {
 	fetchSteers,
 	writeSteer,
 	consumePendingSteers,
+	// closed-goal removal (team_purge / /team-purge)
+	purgeClosedGoals,
+	purgeSummaryLines,
 	// config / db resolution (scope B)
 	edenConfig,
 	resolveDbPath,

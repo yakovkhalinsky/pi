@@ -53,12 +53,12 @@ describe("M1 smoke: harness seams", () => {
 
 	after(() => db.dispose());
 
-	it("registers the six team tools and two commands", async () => {
+	it("registers the seven team tools and three commands", async () => {
 		const { tools, commands } = await loadExtension();
-		for (const name of ["team_status", "team_recall", "team_remember", "team_lookup", "team_decide", "team_steer"]) {
+		for (const name of ["team_status", "team_recall", "team_remember", "team_lookup", "team_decide", "team_steer", "team_purge"]) {
 			assert.ok(tools.has(name), `tool ${name} registered`);
 		}
-		assert.deepEqual([...commands.keys()].sort(), ["steer", "team-board"]);
+		assert.deepEqual([...commands.keys()].sort(), ["steer", "team-board", "team-purge"]);
 	});
 
 	it("classifyState mirrors the SKILL.md router lifecycle table", async () => {
