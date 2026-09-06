@@ -53,7 +53,7 @@ function openGoalPending() {
 }
 
 describe("C2-1/C2-2: team_status goal lines + NEEDS HUMAN DECISION (incl. stranded)", () => {
-	it("goal line format and both decision-line variants appear", async () => {
+	it("default view hides closed rows; stranded decisions still surface; include_closed shows them", async () => {
 		const db = createFixtureDb([...closedGoalWithStranded(), ...openGoalPending()]);
 		try {
 			const { binPath, dispose } = installFixtureBin();
@@ -63,18 +63,30 @@ describe("C2-1/C2-2: team_status goal lines + NEEDS HUMAN DECISION (incl. strand
 					const { ctx } = createMockCtx();
 					const text = (await tools.get("team_status")!.execute("c2", {}, undefined, () => {}, ctx)).content[0].text;
 
-					// goal lines: `goal | stage | owner | state | rec=<8> | n records`
-					assert.ok(text.includes(`${GOAL_TITLE} | Closure | archivist | closed | rec=00000000 | 3 records`));
+					// Closed goals are terminal state: hidden from the default table…
+					assert.ok(!text.includes(`${GOAL_TITLE} | Closure | archivist | closed`), "closed row hidden by default");
+					assert.ok(text.includes("1 closed goal(s) hidden"), "hidden-count line present");
+					// …while the open goal still renders.
 					assert.ok(text.includes(`Open Goal | Pending authorisation | builder | pending_authorisation | rec=00000000 | 2 records`));
 
 					// active pending item
 					assert.ok(
 						text.includes(`NEEDS HUMAN DECISION (pending_authorisation): Open Goal — push to main directly — approve?. Surface to the user; decide via /team-approve or team_decide.`),
 					);
-					// stranded on closed goal (F4) — recordType is humanized
+					// stranded on closed goal (F4) — recordType is humanized; still
+					// surfaced even though the closed row itself is hidden
 					assert.ok(
 						text.includes(`NEEDS HUMAN DECISION (goal closed, Pending authorisation): ${GOAL_TITLE} — wipe the production table — approve?. rec=00000000. team_decide goal_id="${TEST_GOAL}" still works on closed goals; the router handles continuation.`),
 					);
+
+					// include_closed opts back into the full table
+					const full = (await tools.get("team_status")!.execute("c2", { include_closed: true }, undefined, () => {}, ctx)).content[0].text;
+					assert.ok(full.includes(`${GOAL_TITLE} | Closure | archivist | closed | rec=00000000 | 3 records`));
+					assert.ok(!full.includes("closed goal(s) hidden"), "no hidden line when include_closed");
+
+					// an explicit goal_id filter always includes its goal, even closed
+					const byGoal = (await tools.get("team_status")!.execute("c2", { goal_id: TEST_GOAL }, undefined, () => {}, ctx)).content[0].text;
+					assert.ok(byGoal.includes(`${GOAL_TITLE} | Closure | archivist | closed | rec=00000000 | 3 records`), "goal_id filter shows closed goal");
 				});
 			} finally {
 				dispose();

@@ -3,11 +3,13 @@
 Scoping for automated tests over the Agentic Team Protocol stack: **protocol
 adherence**, **memory hygiene**, and **UI display & interaction**.
 
-Status: scope approved. **All milestones landed — M1–M5** (157/157 green ~7s offline;
+Status: scope approved. **All milestones landed — M1–M5, plus F7 (closed-goal
+removal, 2026-09-06)** (179/179 green ~8s offline;
 +3 e2e green with `ATP_E2E=1`): `tests/atp/` — harness + smoke (M1),
 protocol-state / protocol-io / dbpinning-{probe,hijack,override} / scoping-workspace /
 sql-scoping (M2), ui-board / ui-cards / ui-text (M3), eden-sh / tool-surface /
-genericity (M4), widget-poller / steer-ux / commands-board / e2e-real-cli (M5).
+genericity (M4), widget-poller / steer-ux / commands-board / e2e-real-cli (M5),
+purge-closed (F7: team_purge / /team-purge, board default views).
 
 Runner: `node --test tests/atp/*.test.ts` (Node ≥23 native TS type-stripping;
 repo-root `node_modules/` symlinks via `tests/setup.sh`). T3 real-CLI e2e is
@@ -21,7 +23,7 @@ hardcoded or printed).
 
 | Unit | Path | Size |
 |------|------|------|
-| ATP extension (tools, commands, widget, poller) | `~/.pi/agent/extensions/agentic-team-protocol/index.ts` (mirrored at `agent/extensions/…`) | 2,340 lines |
+| ATP extension (tools, commands, widget, poller) | `~/.pi/agent/extensions/agentic-team-protocol/index.ts` (mirrored at `agent/extensions/…`) | ~2,980 lines |
 | Eden-memory CLI wrapper | `~/.pi/agent/skills/agentic-team-protocol/eden.sh` (mirrored at `agent/skills/…`) | 278 lines |
 | Role agents / prompt templates | `~/.pi/agent/{agents,prompts}/` | 7 + 7 files (protocol *text* — out of automated scope) |
 | Eden-memory CLI | `~/.local/bin/eden-memory` (v0.3.x) | external; exercised via stub + real-CLI tiers |

@@ -402,4 +402,44 @@ describe("C7-1b: running agents attach to their goal (de-duplicated agent UI)", 
 			pi.__emit("session_shutdown");
 		}
 	});
+
+	it("closed goals don't hog widget rows: hidden-count line instead; cleared entirely when nothing is live", async () => {
+		const { pi } = await loadExtension();
+		const dbClosed = createFixtureDb([
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "goal_record", stage: "goal_receipt", owner: "dispatcher", body: '{"title":"Done Goal"}', createdAt: 1_760_000_001 }),
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "archival_record", owner: "archivist", status: "completed", createdAt: 1_760_000_002 }),
+		]);
+		const dbStranded = createFixtureDb([
+			...dbClosedRecords(),
+			fixtureRecord({ recordType: "pending_authorisation", stage: "pending_authorisation", owner: "runtime", status: "pending_authorisation", body: "approve the deploy?", createdAt: 1_760_000_003 }),
+		]);
+		function dbClosedRecords() {
+			return [
+				fixtureRecord({ goalId: TEST_GOAL, recordType: "goal_record", stage: "goal_receipt", owner: "dispatcher", body: '{"title":"Done Goal"}', createdAt: 1_760_010_001 }),
+				fixtureRecord({ goalId: TEST_GOAL, recordType: "archival_record", owner: "archivist", status: "completed", createdAt: 1_760_010_002 }),
+			];
+		}
+		try {
+			// closed-only, nothing live, no stranded decisions → widget removed
+			await withEnv(testEnv({ EDEN_MEMORY_DB: dbClosed.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				assert.equal(captured.setWidget["atp-board"], undefined, "terminal-only workspace hides the widget");
+			});
+			// stranded pending on the closed goal → widget stays, needs-you visible
+			await withEnv(testEnv({ EDEN_MEMORY_DB: dbStranded.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const joined = (captured.setWidget["atp-board"] ?? []).map(strip).join("\n");
+				assert.ok(joined.includes("⚠ Needs you (1)"), "stranded decision still surfaced (F4)");
+				assert.ok(joined.includes("approve the deploy?"), "question visible");
+				assert.ok(joined.includes("1 closed goal hidden"), "hidden-count line");
+				assert.ok(!joined.includes("STATE"), "no board header without open goals");
+			});
+		} finally {
+			dbClosed.dispose();
+			dbStranded.dispose();
+			pi.__emit("session_shutdown");
+		}
+	});
 });

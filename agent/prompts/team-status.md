@@ -10,7 +10,7 @@ List active goals, current stage, owner role, and latest record IDs. Optionally 
 ## Steps
 
 1. Parse `$ARGUMENTS`. If it looks like a UUID or starts with `atp-`, treat it as a `goal_id` filter; otherwise treat it as a role filter (one of dispatcher, researcher, builder, runtime, verifier, archivist, router).
-2. Call the `team_status` tool, passing `goal_id` and/or `role` from step 1. The tool reads Eden-memory, groups records by `goal_id`, finds the latest stage per goal, and renders a themed table with state pills (`active`, `blocked`, `pending_authorisation`, `continueable`, `closed`).
+2. Call the `team_status` tool, passing `goal_id` and/or `role` from step 1. The tool reads Eden-memory, groups records by `goal_id`, finds the latest stage per goal, and renders a themed table with state pills (`active`, `blocked`, `pending_authorisation`, `continueable`, `closed`). Closed goals are terminal state: the default view summarizes them in a hidden-count line instead of full rows — pass `include_closed: true` to show them (an explicit `goal_id` filter always includes its goal, even closed).
    - If the `team_status` tool is unavailable (e.g. the `agentic-team-protocol` extension is not loaded), fall back to the raw bash helper:
      ```bash
      source "$HOME/.pi/agent/skills/agentic-team-protocol/eden.sh"

@@ -104,7 +104,25 @@ switch (sub) {
 	case "lookup": {
 		let out = { found: false };
 		try {
-			if (process.env.EDEN_FIXTURE_LOOKUP_JSON) out = JSON.parse(process.env.EDEN_FIXTURE_LOOKUP_JSON);
+			if (process.env.EDEN_FIXTURE_LOOKUP_DB) {
+				// Read the real row from the fixture DB by --id — per-id verification
+				// (team_purge) is then exercised against actual row content/metadata.
+				const { DatabaseSync } = await import("node:sqlite");
+				const flag = (name) => {
+					const i = argv.indexOf(name);
+					return i === -1 ? undefined : argv[i + 1];
+				};
+				const dbPath = flag("--db");
+				const rowId = flag("--id");
+				if (dbPath && rowId) {
+					const db = new DatabaseSync(dbPath);
+					const row = db.prepare("SELECT id, content, metadata FROM memories WHERE id = ?").get(rowId);
+					db.close();
+					if (row) out = { found: true, id: row.id, content: row.content, metadata: JSON.parse(row.metadata || "{}") };
+				}
+			} else if (process.env.EDEN_FIXTURE_LOOKUP_JSON) {
+				out = JSON.parse(process.env.EDEN_FIXTURE_LOOKUP_JSON);
+			}
 		} catch {
 			/* fall back to found:false */
 		}
