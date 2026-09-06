@@ -1,5 +1,5 @@
 /**
- * C9 — dropout auto-recovery: stream-dropout ("Child subagent finished
+ * C10 — dropout auto-recovery: stream-dropout ("Child subagent finished
  * without an assistant response") detection in subagent/subagent_resume
  * tool_results, session-id extraction, the max-1 auto-recovery budget per
  * child session id, and the narrated-recovery steer the extension queues so
