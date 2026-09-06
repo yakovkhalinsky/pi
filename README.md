@@ -8,16 +8,21 @@ configuration on another macOS/Linux machine from a clean clone.
 
 | Path | What |
 |------|------|
+| `AGENTS.md` | Rules every pi session in this repo auto-loads (public-safe hygiene, docs-sync rule). |
 | `bin/pi` | Wrapper shim that execs pi on its own bundled Node (`~/.pi/node`). |
 | `agent/agents/` | ATP role definitions (archivist, builder, dispatcher, researcher, router, runtime, verifier). |
 | `agent/prompts/` | Team prompt templates (team-charter, team-continue, team-escalate, team-handoff, team-status, team). |
 | `agent/extensions/` | Extension source (agentic-team-protocol, web-search-pretty). |
 | `agent/skills/` | Skills (agentic-team-protocol: README, CHARTER, SKILL, eden.sh). |
 | `agent/settings.json` | Safe prefs only (theme, defaultModel, defaultProvider, compaction, packages) — **no secrets**. |
+| `agent/pi-pretty.json` | pi-pretty extension config (icons, tool rendering opts) — safe prefs. |
 | `agent/models.example.json` | Sanitized provider/model template with `apiKey: ""`. `install.sh` copies it to `~/.pi/agent/models.json` only if the target doesn't already exist. |
 | `agent/npm/.gitignore` | Self-ignoring marker for the npm extension cache (node_modules and the lockfile are regenerated, never committed). |
 | `agent/npm/package.json` | Pinned extension manifest: exact versions of `pi-submarine`, `@heyhuynhgiabuu/pi-pretty`, `@heyhuynhgiabuu/pi-diff`, `@ollama/pi-web-search`, a `diff` security override (CVE-2026-24001), and the `allowScripts` install-script policy. |
-| `install.sh` | Idempotent installer that recreates `~/.pi` from this directory. |
+| `install.sh` | Idempotent, fully pinned installer that recreates `~/.pi` from this directory. |
+| `scripts/check-public-safe.sh` | Scanner blocking secret file names, credential values, eden-memory IDs, and personal absolute paths (`--staged` default, `--all` for CI). |
+| `.githooks/pre-commit` | Runs the scanner before every commit (enable with `git config core.hooksPath .githooks`). |
+| `.github/workflows/public-safe.yml` | Runs the scanner on every push/PR. |
 
 ## What's deliberately NOT backed up
 
@@ -70,12 +75,13 @@ staging directory, verifies it runs, and atomically swaps it into place — so
 2. `npm install -g @earendil-works/pi-coding-agent@0.85.1` into `~/.pi/node` (pinned version — skips if already installed).
 3. Installs the `bin/pi` wrapper shim to `~/.pi/bin/pi`.
 4. Copies `agents/`, `prompts/`, `extensions/`, `skills/` to `~/.pi/agent/` (only if missing).
-5. Copies `settings.json` to `~/.pi/agent/` (only if missing), then pins the extension package specs in `packages` to the manifest versions (existing entries only — nothing added or removed).
+5. Copies `settings.json` and `pi-pretty.json` to `~/.pi/agent/` (only if missing), then pins the extension package specs in `packages` to the manifest versions (existing entries only — nothing added or removed).
 6. Copies the sanitized `models.example.json` to `~/.pi/agent/models.json` (only if missing — you then fill in the real `apiKey`).
 7. Ensures empty `auth.json` / `models-store.json` placeholders exist (`{}`).
 8. Merges the pinned extension manifest (exact versions, `diff` security override, `allowScripts` policy) into `~/.pi/agent/npm/package.json`, then runs `npm install` there to reconcile `node_modules`.
 9. Runs `pi update --extensions` to reconcile installed packages (pinned specs are skipped by design — nothing floats to latest).
-10. Adds `export PATH="$HOME/.pi/bin:$PATH"` to the detected shell's rc file (`$SHELL`: zsh → `.zshrc`, bash → `.bashrc`/`.bash_profile`, fish → `config.fish` via `fish_add_path`; unknown shells get manual instructions), and checks the eden-memory (ATP) identity config.
+10. Adds `export PATH="$HOME/.pi/bin:$PATH"` to the detected shell's rc file (`$SHELL`: zsh → `.zshrc`, bash → `.bashrc`/`.bash_profile`, fish → `config.fish` via `fish_add_path`; unknown shells get manual instructions).
+11. Checks the eden-memory (ATP) identity config (`EDEN_ORG_ID` etc. — informs, never aborts).
 
 ## Updating this backup
 
@@ -88,11 +94,15 @@ cp -R ~/.pi/agent/agents    agent/agents
 cp -R ~/.pi/agent/prompts   agent/prompts
 cp -R ~/.pi/agent/extensions agent/extensions
 cp -R ~/.pi/agent/skills    agent/skills
-cp ~/.pi/agent/settings.json     agent/settings.json
-cp ~/.pi/agent/npm/package.json  agent/npm/package.json
-cp ~/.pi/bin/pi              bin/pi
-# re-sanitize models.json → pi/agent/models.example.json (set apiKey: "")
-git add agent/ bin/ install.sh
+cp ~/.pi/agent/settings.json    agent/settings.json
+cp ~/.pi/agent/npm/package.json agent/npm/package.json
+cp ~/.pi/bin/pi             bin/pi
+# re-sanitize models.json → agent/models.example.json (set apiKey: "")
+# if pinned versions or installer behavior changed, update the version pins
+# (install.sh PI_VERSION, agent/npm/package.json, agent/settings.json) and
+# the docs (README install steps + install.sh header) in the same commit
+sh scripts/check-public-safe.sh
+git add -A
 git commit -m "Update pi setup backup"
 git push origin main
 ```

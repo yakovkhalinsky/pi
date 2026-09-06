@@ -6,7 +6,7 @@
 # Everything is PINNED to versions verified warning-free (npm audit clean,
 # every install script covered by the allowScripts policy) — the installer
 # never floats anything to "latest", so re-running it is reproducible. It
-# pinned the extension packages to the tested versions, copies portable
+# pins the extension packages to the tested versions, copies portable
 # config that is missing, and adds the PATH entry to the shell's rc file.
 #
 # To bump versions deliberately: install/test the new pi or extension
@@ -14,16 +14,20 @@
 # (update allowScripts in agent/npm/package.json), then update PI_VERSION
 # here and the pins in agent/npm/package.json + agent/settings.json.
 #
-# Source layout (this repo's pi/ dir):
-#   pi/bin/pi                       wrapper shim
-#   pi/agent/agents/  prompts/  extensions/  skills/   portable config
-#   pi/agent/settings.json          safe prefs (no secrets); packages pinned
-#   pi/agent/pi-pretty.json         pi-pretty extension config (safe prefs)
-#   pi/agent/models.example.json    sanitized provider template (apiKey: "")
-#   pi/agent/npm/.gitignore         self-ignoring npm cache marker
-#   pi/agent/npm/package.json       pinned extension manifest (exact versions
+# Source layout (repo root):
+#   AGENTS.md                       agent rules (public-safe hygiene, docs sync)
+#   bin/pi                          wrapper shim
+#   agent/agents/  prompts/  extensions/  skills/   portable config
+#   agent/settings.json             safe prefs (no secrets); packages pinned
+#   agent/pi-pretty.json            pi-pretty extension config (safe prefs)
+#   agent/models.example.json       sanitized provider template (apiKey: "")
+#   agent/npm/.gitignore            self-ignoring npm cache marker
+#   agent/npm/package.json          pinned extension manifest (exact versions
 #                                   + diff security override + allowScripts
 #                                   install-script policy)
+#   scripts/check-public-safe.sh    secret/private-info scanner (--all | staged)
+#   .githooks/pre-commit            runs the scanner before every commit
+#   .github/workflows/public-safe.yml  runs the scanner on every push/PR
 #
 # Usage:  git clone git@github.com:yakovkhalinsky/pi.git && cd pi && ./install.sh
 set -e
