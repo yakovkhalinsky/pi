@@ -6,9 +6,8 @@
 # Everything is PINNED to versions verified warning-free (npm audit clean,
 # every install script covered by the allowScripts policy) — the installer
 # never floats anything to "latest", so re-running it is reproducible. It
-# downloads Node + the pinned pi npm package, installs the wrapper shim,
-# pins the extension packages to the tested versions, copies portable config
-# that is missing, and ensures the PATH line exists.
+# pinned the extension packages to the tested versions, copies portable
+# config that is missing, and adds the PATH entry to the shell's rc file.
 #
 # To bump versions deliberately: install/test the new pi or extension
 # versions, resolve any new npm audit findings and install-script warnings
@@ -321,17 +320,69 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 9. PATH — append the pi bin dir to ~/.zshrc once
+# 9. PATH — add the pi bin dir to the shell's rc file once
+#
+#    Detects the user's shell ($SHELL, falling back to /etc/passwd) and
+#    appends the entry with the right syntax to the right file:
+#      zsh  → ${ZDOTDIR:-$HOME}/.zshrc                        export PATH=...
+#      bash → ~/.bashrc (Linux); on macOS prefers ~/.bash_profile
+#             (login shell), falling back to .bash_login/.profile
+#      fish → ~/.config/fish/config.fish                      fish_add_path
+#             (built-in ≥ fish 3.2, dedupes on its own)
+#      sh   → ~/.profile                                      export PATH=...
+#    Any other shell: prints the line to add manually and continues.
+#    Idempotency marker shared by all shells: the literal 'HOME/.pi/bin'.
 # ---------------------------------------------------------------------------
-PATH_LINE='export PATH="$HOME/.pi/bin:$PATH"'
-ZSHRC="$HOME/.zshrc"
-touch "$ZSHRC"
-if grep -qF 'HOME/.pi/bin' "$ZSHRC"; then
-  echo ">> PATH line for ~/.pi/bin already in $ZSHRC — skipping"
-else
-  printf '\n# pi (coding agent) — added by pi/install.sh\n%s\n' "$PATH_LINE" >> "$ZSHRC"
-  echo ">> Appended PATH line to $ZSHRC"
-fi
+append_path_entry() {  # <rc-file> <line>
+  rc="$1" entry="$2"
+  [ -f "$rc" ] || : > "$rc"
+  if grep -qF 'HOME/.pi/bin' "$rc"; then
+    echo ">> PATH entry for ~/.pi/bin already in $rc — skipping"
+  else
+    printf '\n# pi (coding agent) — added by pi/install.sh\n%s\n' "$entry" >> "$rc"
+    echo ">> Appended PATH entry to $rc"
+  fi
+}
+
+EXPORT_LINE='export PATH="$HOME/.pi/bin:$PATH"'
+FISH_LINE='fish_add_path "$HOME/.pi/bin"'
+# $SHELL first (the login shell); /etc/passwd as fallback, in two steps —
+# deeply nested quoting inside $() breaks dash's parser.
+LOGIN_SHELL="$(awk -F: -v u="$(id -u)" '$3==u {print $7; exit}' /etc/passwd 2>/dev/null)"
+SHELL_NAME="$(basename "${SHELL:-$LOGIN_SHELL}")"
+case "$SHELL_NAME" in
+  *zsh)
+    append_path_entry "${ZDOTDIR:-$HOME}/.zshrc" "$EXPORT_LINE"
+    ;;
+  *bash)
+    if [ "$(uname -s)" = "Darwin" ]; then
+      if   [ -f "$HOME/.bash_profile" ]; then BRC="$HOME/.bash_profile"
+      elif [ -f "$HOME/.bash_login" ];   then BRC="$HOME/.bash_login"
+      elif [ -f "$HOME/.profile" ];     then BRC="$HOME/.profile"
+      else BRC="$HOME/.bash_profile"
+      fi
+    else
+      BRC="$HOME/.bashrc"
+    fi
+    append_path_entry "$BRC" "$EXPORT_LINE"
+    ;;
+  *fish)
+    FISH_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fish"
+    mkdir -p "$FISH_DIR"
+    append_path_entry "$FISH_DIR/config.fish" "$FISH_LINE"
+    ;;
+  sh|dash|ash)
+    append_path_entry "$HOME/.profile" "$EXPORT_LINE"
+    ;;
+  "")
+    echo ">> WARNING: could not detect your shell — add this to its rc file manually:" >&2
+    echo ">>   $EXPORT_LINE" >&2
+    ;;
+  *)
+    echo ">> WARNING: unsupported shell '$SHELL_NAME' — add this to its rc file manually:" >&2
+    echo ">>   $EXPORT_LINE" >&2
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 10. eden-memory (ATP) identity config — ALWAYS check for config that isn't

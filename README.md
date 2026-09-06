@@ -75,7 +75,7 @@ staging directory, verifies it runs, and atomically swaps it into place — so
 7. Ensures empty `auth.json` / `models-store.json` placeholders exist (`{}`).
 8. Merges the pinned extension manifest (exact versions, `diff` security override, `allowScripts` policy) into `~/.pi/agent/npm/package.json`, then runs `npm install` there to reconcile `node_modules`.
 9. Runs `pi update --extensions` to reconcile installed packages (pinned specs are skipped by design — nothing floats to latest).
-10. Appends `export PATH="$HOME/.pi/bin:$PATH"` to `~/.zshrc` once and checks the eden-memory (ATP) identity config.
+10. Adds `export PATH="$HOME/.pi/bin:$PATH"` to the detected shell's rc file (`$SHELL`: zsh → `.zshrc`, bash → `.bashrc`/`.bash_profile`, fish → `config.fish` via `fish_add_path`; unknown shells get manual instructions), and checks the eden-memory (ATP) identity config.
 
 ## Updating this backup
 
