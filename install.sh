@@ -7,7 +7,9 @@
 # every install script covered by the allowScripts policy) — the installer
 # never floats anything to "latest", so re-running it is reproducible. It
 # pins the extension packages to the tested versions, copies portable
-# config that is missing, and adds the PATH entry to the shell's rc file.
+# config that is missing, removes other installed `pi` executables that
+# would shadow the wrapper shim (a mise-managed pi, a mise-forcing wrapper
+# in ~/.local/bin), and adds the PATH entry to the shell's rc file.
 #
 # To bump versions deliberately: install/test the new pi or extension
 # versions, resolve any new npm audit findings and install-script warnings
@@ -155,6 +157,123 @@ fi
 mkdir -p "$PI_BIN"
 install -m 0755 "$HERE/bin/pi" "$PI_BIN/pi"
 echo ">> Installed wrapper shim → $PI_BIN/pi"
+
+# ---------------------------------------------------------------------------
+# 3b. Remove other `pi` executables that would shadow the wrapper shim
+#
+#     Whichever executable named `pi` resolves first on PATH runs when the
+#     user types `pi`. A second, independently-managed pi (typically a
+#     version-manager copy, or a wrapper script that re-execs the version
+#     manager) therefore shadows the pinned install whenever it wins PATH
+#     order — and because rc files commonly add version-manager paths AFTER
+#     this installer's PATH entry, and shells opened before the install keep
+#     their old PATH, the user ends up on an outdated pi with stale "update
+#     available" notifications even though the pinned version is installed.
+#     Known shadow sources are removed:
+#       - a ~/.local/bin/pi wrapper that drives mise
+#       - a mise-managed pi: uninstall all installed versions, drop the tool
+#         entry from the global mise config (otherwise the next `mise
+#         install`/`mise reshim` would silently bring the shadow back), and
+#         re-shim so stale pi shims disappear
+#     Any other `pi` found on PATH is left untouched and reported on stderr
+#     (the installer can't classify it safely). Project-local mise configs
+#     that request pi are out of scope. Set PI_KEEP_MISE_PI=1 to skip the
+#     mise cleanup (not recommended — see above). Idempotent: with no
+#     shadows present this step is a no-op.
+# ---------------------------------------------------------------------------
+PI_MISE_HOME="$HOME/.local/share/mise"
+pi_shadow_fixed=""
+pi_leftover=""
+
+# 3b-1. mise-managed pi (checks mise's data dir and global config, not just
+#       the PATH the installer inherited — shadows can exist off-PATH too)
+if [ -n "$PI_KEEP_MISE_PI" ]; then
+  echo ">> PI_KEEP_MISE_PI=1 — keeping any mise-managed pi (it may shadow $PI_BIN/pi)" >&2
+elif command -v mise >/dev/null 2>&1; then
+  pi_mise_cfg1="${MISE_GLOBAL_CONFIG_FILE:-$HOME/.config/mise/config.toml}"
+  if [ -d "$PI_MISE_HOME/installs/pi" ] || [ -e "$PI_MISE_HOME/shims/pi" ] \
+     || grep -qsE '^[[:space:]]*pi[[:space:]]*=' "$pi_mise_cfg1" "$HOME/.mise.toml" 2>/dev/null; then
+    echo ">> Removing mise-managed pi (shadows $PI_BIN/pi depending on PATH order)"
+    if ! mise uninstall pi; then
+      echo ">> WARNING: 'mise uninstall pi' failed — remove mise's pi manually" >&2
+    fi
+    for pi_mise_cfg in "$pi_mise_cfg1" "$HOME/.mise.toml"; do
+      [ -f "$pi_mise_cfg" ] || continue
+      grep -qE '^[[:space:]]*pi[[:space:]]*=' "$pi_mise_cfg" || continue
+      if grep -qE '^[[:space:]]*pi[[:space:]]*=[[:space:]]*\[' "$pi_mise_cfg"; then
+        echo ">> WARNING: $pi_mise_cfg defines pi as a multi-line TOML array — not auto-editing." >&2
+        echo ">>          Remove the pi entry manually or mise will re-install it and it" >&2
+        echo ">>          will shadow $PI_BIN/pi again" >&2
+        continue
+      fi
+      pi_mise_tmp="$pi_mise_cfg.tmp.$$"
+      if awk -v cfg="$pi_mise_cfg" '
+        /^\[/ { intools = ($0 ~ /^\[tools\][[:space:]]*(#.*)?$/); print; next }
+        intools && /^[[:space:]]*pi[[:space:]]*=/ { printf ">>   %s: removed %s\n", cfg, $0 > "/dev/stderr"; next }
+        { print }
+      ' "$pi_mise_cfg" > "$pi_mise_tmp" && mv "$pi_mise_tmp" "$pi_mise_cfg"; then
+        echo ">> Dropped the pi entry from $pi_mise_cfg (mise would otherwise re-install it)"
+      else
+        rm -f "$pi_mise_tmp"
+        echo ">> WARNING: could not rewrite $pi_mise_cfg — remove its 'pi =' entry manually," >&2
+        echo ">>          or mise will re-install pi and it will shadow $PI_BIN/pi again" >&2
+      fi
+    done
+    if ! mise reshim; then
+      echo ">> WARNING: 'mise reshim' failed — run it manually to drop stale pi shims" >&2
+    fi
+    rm -f "$PI_MISE_HOME/shims/pi"    # belt-and-braces: no tool, no shim
+    pi_shadow_fixed=1
+  fi
+fi
+
+# 3b-2. ~/.local/bin/pi wrapper (a script or symlink that launches a
+#       version-manager pi regardless of PATH order)
+pi_local_bin="$HOME/.local/bin/pi"
+pi_action=""
+if [ -L "$pi_local_bin" ]; then
+  pi_link_target="$(readlink "$pi_local_bin" 2>/dev/null || true)"
+  case "$pi_link_target" in
+    "$PI_BIN/pi") pi_action="keep" ;;  # points at our shim — fine
+    *mise*)           pi_action="remove" ;;
+    *)                pi_action="warn" ;;
+  esac
+elif [ -f "$pi_local_bin" ]; then
+  if grep -qs 'mise' "$pi_local_bin" && grep -qs 'pi' "$pi_local_bin"; then
+    pi_action="remove"                 # wrapper that re-execs mise's pi
+  else
+    pi_action="warn"                   # unknown content — don't touch it
+  fi
+fi
+if [ "$pi_action" = "remove" ] && [ -n "$PI_KEEP_MISE_PI" ]; then
+  pi_action="warn"
+fi
+case "$pi_action" in
+  remove)
+    rm -f "$pi_local_bin"
+    echo ">> Removed $pi_local_bin (it resolves to mise's pi instead of $PI_BIN/pi)"
+    pi_shadow_fixed=1
+    ;;
+  warn) pi_leftover="$pi_leftover $pi_local_bin" ;;
+esac
+
+# 3b-3. Report any remaining `pi` on PATH that this installer doesn't manage
+OLDIFS="$IFS"; IFS=:
+for pi_dir in $PATH "$HOME/.local/bin"; do
+  IFS="$OLDIFS"
+  case "$pi_dir" in "") continue ;; esac
+  pi_cand="$pi_dir/pi"
+  [ -f "$pi_cand" ] || continue
+  case "$pi_cand" in "$PI_BIN/pi"|"$PI_NODE/bin/pi") continue ;; esac
+  case " $pi_leftover " in *" $pi_cand "*) continue ;; esac
+  pi_leftover="$pi_leftover $pi_cand"
+done
+IFS="$OLDIFS"
+for pi_cand in $pi_leftover; do
+  echo ">> WARNING: found another 'pi' at $pi_cand — not managed by this installer, left in place." >&2
+  echo ">>          If it resolves before $PI_BIN/pi it shadows the pinned install (stale" >&2
+  echo ">>          update notifications). Remove it or make sure $PI_BIN comes first on PATH." >&2
+done
 
 # ---------------------------------------------------------------------------
 # 4. Portable config dirs (never overwrite existing ones)
@@ -409,6 +528,11 @@ else
   echo ">> Skipping eden-memory config check (bash or $EDEN_SKILL not found)"
 fi
 
+if [ -n "$pi_shadow_fixed" ] || [ -n "$pi_leftover" ]; then
+  echo ""
+  echo "NOTE: shells opened BEFORE this run may still resolve an old 'pi'."
+  echo "Run 'hash -r' (bash/zsh) or open a new terminal so \$PATH picks up $PI_BIN."
+fi
 echo ""
 echo "Done. ~/.pi recreated."
 echo "Next: run 'pi login' (or edit ~/.pi/agent/models.json) to populate credentials,"

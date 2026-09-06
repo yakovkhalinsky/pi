@@ -74,14 +74,15 @@ staging directory, verifies it runs, and atomically swaps it into place — so
 1. Downloads Node v24.19.0 for your `uname -m`/`uname -s` into a staging dir, verifies it runs and reports the pinned version, then atomically swaps it into `~/.pi/node/`. Skips the download if `~/.pi/node` is already at that version; a version change cleanly replaces (never merges) the old Node.
 2. `npm install -g @earendil-works/pi-coding-agent@0.85.1` into `~/.pi/node` (pinned version — skips if already installed).
 3. Installs the `bin/pi` wrapper shim to `~/.pi/bin/pi`.
-4. Copies `agents/`, `prompts/`, `extensions/`, `skills/` to `~/.pi/agent/` (only if missing).
-5. Copies `settings.json` and `pi-pretty.json` to `~/.pi/agent/` (only if missing), then pins the extension package specs in `packages` to the manifest versions (existing entries only — nothing added or removed).
-6. Copies the sanitized `models.example.json` to `~/.pi/agent/models.json` (only if missing — you then fill in the real `apiKey`).
-7. Ensures empty `auth.json` / `models-store.json` placeholders exist (`{}`).
-8. Merges the pinned extension manifest (exact versions, `diff` security override, `allowScripts` policy) into `~/.pi/agent/npm/package.json`, then runs `npm install` there to reconcile `node_modules`.
-9. Runs `pi update --extensions` to reconcile installed packages (pinned specs are skipped by design — nothing floats to latest).
-10. Adds `export PATH="$HOME/.pi/bin:$PATH"` to the detected shell's rc file (`$SHELL`: zsh → `.zshrc`, bash → `.bashrc`/`.bash_profile`, fish → `config.fish` via `fish_add_path`; unknown shells get manual instructions).
-11. Checks the eden-memory (ATP) identity config (`EDEN_ORG_ID` etc. — informs, never aborts).
+4. Removes other `pi` executables that would shadow the shim: a mise-managed pi (uninstalls all its versions, drops the `pi` entry from the global mise config so the next `mise install`/`mise reshim` can't silently re-install it, then re-shims) and a mise-forcing `~/.local/bin/pi` wrapper. Set `PI_KEEP_MISE_PI=1` to skip the mise cleanup. Any other `pi` found on PATH is reported on stderr and left in place.
+5. Copies `agents/`, `prompts/`, `extensions/`, `skills/` to `~/.pi/agent/` (only if missing).
+6. Copies `settings.json` and `pi-pretty.json` to `~/.pi/agent/` (only if missing), then pins the extension package specs in `packages` to the manifest versions (existing entries only — nothing added or removed).
+7. Copies the sanitized `models.example.json` to `~/.pi/agent/models.json` (only if missing — you then fill in the real `apiKey`).
+8. Ensures empty `auth.json` / `models-store.json` placeholders exist (`{}`).
+9. Merges the pinned extension manifest (exact versions, `diff` security override, `allowScripts` policy) into `~/.pi/agent/npm/package.json`, then runs `npm install` there to reconcile `node_modules`.
+10. Runs `pi update --extensions` to reconcile installed packages (pinned specs are skipped by design — nothing floats to latest).
+11. Adds `export PATH="$HOME/.pi/bin:$PATH"` to the detected shell's rc file (`$SHELL`: zsh → `.zshrc`, bash → `.bashrc`/`.bash_profile`, fish → `config.fish` via `fish_add_path`; unknown shells get manual instructions).
+12. Checks the eden-memory (ATP) identity config (`EDEN_ORG_ID` etc. — informs, never aborts).
 
 ## Updating this backup
 
