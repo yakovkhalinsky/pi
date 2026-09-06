@@ -4,7 +4,8 @@ Scoping for automated tests over the Agentic Team Protocol stack: **protocol
 adherence**, **memory hygiene**, and **UI display & interaction**.
 
 Status: scope approved. **All milestones landed — M1–M5, plus F7 (closed-goal
-removal, 2026-09-06)** (179/179 green ~8s offline;
+removal, 2026-09-06) and F5b-adjacent dropout visibility (stall marker +
+transient errored rows in widget-poller, 2026-09-06)** (193/193 green ~8s offline;
 +3 e2e green with `ATP_E2E=1`): `tests/atp/` — harness + smoke (M1),
 protocol-state / protocol-io / dbpinning-{probe,hijack,override} / scoping-workspace /
 sql-scoping (M2), ui-board / ui-cards / ui-text (M3), eden-sh / tool-surface /

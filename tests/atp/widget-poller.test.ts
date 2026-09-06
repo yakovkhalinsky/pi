@@ -443,3 +443,220 @@ describe("C7-1b: running agents attach to their goal (de-duplicated agent UI)", 
 		}
 	});
 });
+describe("C7-7: stall marker — isStalled + stalled rendering", () => {
+	const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t } as any;
+	const base = { episodeId: "e", sessionId: "s", agent: "verifier", parentEpisodeId: null, startedAt: NOW - 12 * 60_000, turns: 12 } as const;
+	it("thinking stub + 5m of no transcript churn → stalled", () => {
+		const row = { ...base, status: "running", lastActivity: "thinking", lastEventAt: NOW - 5 * 60_000 } as any;
+		assert.equal(mod.isStalled(row, NOW), true);
+	});
+	it("never-started row ('starting…', no lastEventAt) stalls off startedAt", () => {
+		const row = { ...base, status: "running", lastActivity: "starting…" } as any;
+		assert.equal(mod.isStalled(row, NOW), true);
+	});
+	it("pending tool calls, toolResult states, fresh churn and finished rows are exempt", () => {
+		assert.equal(mod.isStalled({ ...base, status: "running", lastActivity: "→ bash", lastEventAt: NOW - 10 * 60_000 } as any, NOW), false, "long pending tool call is healthy");
+		assert.equal(mod.isStalled({ ...base, status: "running", lastActivity: "bash ✓", lastEventAt: NOW - 10 * 60_000 } as any, NOW), false, "toolResult think-gap is healthy");
+		assert.equal(mod.isStalled({ ...base, status: "running", lastActivity: "thinking", lastEventAt: NOW - 30_000 } as any, NOW), false, "fresh churn");
+		assert.equal(mod.isStalled({ ...base, status: "running", lastActivity: "thinking", lastEventAt: NOW - 3 * 60_000 } as any, NOW), false, "exactly STALL_AFTER_MS is not yet stalled");
+		assert.equal(mod.isStalled({ ...base, status: "failed", lastActivity: "thinking", lastEventAt: NOW - 5 * 60_000, finishedAt: NOW - 60_000 } as any, NOW), false, "terminal rows never stall");
+	});
+	it("stalled rendering swaps the elapsed timer for 'silent Xm' (loose + attached)", () => {
+		const row = { ...base, status: "running", lastActivity: "thinking", lastEventAt: NOW - 4 * 60_000 } as any;
+		assert.equal(strip(mod.formatSubagentRow(theme, row, NOW)), "● verifier ⚠ stalled? · thinking · 12 turns · silent 4m");
+		assert.equal(strip(mod.formatGoalActivityLine(theme, row, false, NOW)), "  ● ⚠ stalled? · thinking · 12 turns · silent 4m");
+	});
+	it("non-stalled rendering is byte-identical to the historical format", () => {
+		const row = { episodeId: "e", sessionId: "s", agent: "builder", parentEpisodeId: null, status: "running", startedAt: NOW - 6 * 60_000, turns: 14, lastActivity: "→ edit runner.ts", lastEventAt: NOW } as any;
+		assert.equal(strip(mod.formatSubagentRow(theme, row, NOW)), "● builder · → edit runner.ts · 14 turns · 6m");
+		assert.equal(strip(mod.formatGoalActivityLine(theme, row, false, NOW)), "  ● → edit runner.ts · 14 turns · 6m");
+	});
+	it("failed rows carry the clipped error text", () => {
+		const row = { ...base, status: "failed", finishedAt: NOW - 60_000, error: "Child subagent finished without an assistant response." } as any;
+		const line = strip(mod.formatSubagentRow(theme, row, NOW));
+		assert.ok(line.startsWith("✗ verifier") && line.includes("Child subagent finished without an assistant response."), line);
+	});
+});
+
+describe("C7-8: manifest error capture + churn timestamps", () => {
+	let pi: any;
+	const dir = mkdtempSync(join(tmpdir(), "atp-err-"));
+	const manifest = join(dir, "manifest.jsonl");
+	const session = join(dir, "child.jsonl");
+	before(async () => {
+		({ pi } = await loadExtension());
+	});
+	after(() => {
+		rmSync(dir, { recursive: true, force: true });
+		pi.__emit("session_shutdown");
+	});
+
+	it("finished failed record flips status and captures row.error", () => {
+		writeFileSync(manifest, JSON.stringify({ type: "started", episodeId: "ep-err", sessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", agent: "researcher", sessionFile: session, startedAt: new Date(NOW - 10 * 60_000).toISOString() }) + "\n");
+		assert.equal(mod.pollManifest(manifest), true);
+		const row = mod.sortedSubagentRows().find((r: any) => r.episodeId === "ep-err")!;
+		assert.equal(row.status, "running");
+		assert.equal(row.lastEventAt, Date.parse(new Date(NOW - 10 * 60_000).toISOString()), "started record seeds lastEventAt");
+		appendFileSync(manifest, JSON.stringify({ type: "finished", episodeId: "ep-err", status: "failed", error: "Child subagent finished without an assistant response.", finishedAt: new Date(NOW - 30_000).toISOString() }) + "\n");
+		assert.equal(mod.pollManifest(manifest), true);
+		assert.equal(row.status, "failed");
+		assert.equal(row.error, "Child subagent finished without an assistant response.");
+	});
+	it("resume_started resets lastEventAt and clears the stale error", () => {
+		appendFileSync(manifest, JSON.stringify({ type: "resume_started", episodeId: "ep-err", sessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", agent: "researcher", sessionFile: session, startedAt: new Date(NOW - 60_000).toISOString() }) + "\n");
+		assert.equal(mod.pollManifest(manifest), true);
+		const row = mod.sortedSubagentRows().find((r: any) => r.episodeId === "ep-err")!;
+		assert.equal(row.status, "running");
+		assert.equal(row.lastEventAt, Date.parse(new Date(NOW - 60_000).toISOString()));
+		assert.equal(row.error, undefined);
+	});
+	it("child entries — even user prompts describeSessionEntry ignores — count as churn", () => {
+		// entries must be newer than the resume's lastEventAt (churn is monotonic)
+		writeFileSync(session, JSON.stringify({ type: "message", message: { role: "user", content: "go" }, timestamp: new Date(NOW - 30_000).toISOString() }) + "\n");
+		mod.pollChildSessions();
+		const row = mod.sortedSubagentRows().find((r: any) => r.episodeId === "ep-err")!;
+		assert.equal(row.lastEventAt, Date.parse(new Date(NOW - 30_000).toISOString()), "user entry churn advances lastEventAt (timestamp path, not Date.now())");
+		assert.equal(row.turns, 0, "user entries churn but add no turns");
+		appendFileSync(session, JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "hmm" }] }, timestamp: new Date(NOW - 20_000).toISOString() }) + "\n");
+		mod.pollChildSessions();
+		assert.equal(row.lastEventAt, Date.parse(new Date(NOW - 20_000).toISOString()), "newest entry timestamp wins");
+		assert.equal(row.turns, 1);
+	});
+});
+
+describe("C7-9: reconcileErroredSubagentResult — details:null died-child reconcile", () => {
+	let pi: any;
+	const dir = mkdtempSync(join(tmpdir(), "atp-recon-"));
+	const manifest = join(dir, "manifest.jsonl");
+	const session = join(dir, "child.jsonl");
+	const SID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+	before(async () => {
+		({ pi } = await loadExtension());
+	});
+	after(() => {
+		rmSync(dir, { recursive: true, force: true });
+		pi.__emit("session_shutdown");
+	});
+	function seedRunning(episodeId: string, sessionId: string) {
+		// append (never truncate to same-length content — the offset tail would see nothing)
+		appendFileSync(manifest, JSON.stringify({ type: "started", episodeId, sessionId, agent: "verifier", sessionFile: session, startedAt: new Date(NOW - 5 * 60_000).toISOString() }) + "\n");
+		mod.pollManifest(manifest);
+	}
+	it("flips the matching running row to failed with the error sentence (heading skipped)", () => {
+		seedRunning("ep-rc1", SID);
+		writeFileSync(session, JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "bash" }] }, timestamp: new Date(NOW - 60_000).toISOString() }) + "\n");
+		mod.pollChildSessions();
+		const n = mod.reconcileErroredSubagentResult({
+			isError: true,
+			content: [{ type: "text", text: `## Subagent verifier error\n\nChild subagent finished without an assistant response.\n\nSubagent session ID: ${SID}` }],
+		});
+		assert.equal(n, 1);
+		const row = mod.sortedSubagentRows().find((r: any) => r.episodeId === "ep-rc1")!;
+		assert.equal(row.status, "failed");
+		assert.equal(row.error, "Child subagent finished without an assistant response.", "error sentence, not the ## heading");
+		assert.ok(row.finishedAt, "terminal timestamp set");
+		appendFileSync(session, JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "late" }] } }) + "\n");
+		mod.pollChildSessions();
+		assert.equal(row.lastActivity, "→ bash", "finished row no longer tailed");
+	});
+	it("unknown sessionId / non-error events reconcile nothing", () => {
+		seedRunning("ep-rc2", "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+		assert.equal(mod.reconcileErroredSubagentResult({ isError: true, content: [{ type: "text", text: "Subagent session ID: dddddddd-dddd-4ddd-8ddd-dddddddddddd" }] }), 0, "unknown session id");
+		assert.equal(mod.reconcileErroredSubagentResult({ isError: false, content: [{ type: "text", text: "Subagent session ID: cccccccc-cccc-4ccc-8ccc-cccccccccccc" }] }), 0, "not an error result");
+		assert.equal(mod.reconcileErroredSubagentResult({ isError: true, content: [{ type: "text", text: "no session id in here" }] }), 0, "no session id marker");
+		const row = mod.sortedSubagentRows().find((r: any) => r.episodeId === "ep-rc2")!;
+		assert.equal(row.status, "running");
+	});
+});
+
+describe("C7-10: recentErroredRows + transient ✗ surfacing in renderWidget", () => {
+	const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t } as any;
+	const base = { episodeId: "f", sessionId: "s", agent: "verifier", parentEpisodeId: null, startedAt: NOW - 10 * 60_000, turns: 3 } as const;
+	it("formatErroredRow: attached + loose shapes, aborted keeps its ⏹ mark", () => {
+		const row = { ...base, status: "failed", finishedAt: NOW - 30_000, error: "boom" } as any;
+		assert.equal(strip(mod.formatErroredRow(theme, row, NOW, false)), "  ✗ failed · boom · 30s ago");
+		assert.equal(strip(mod.formatErroredRow(theme, row, NOW, true)), "✗ verifier · failed · boom · 30s ago");
+		assert.ok(strip(mod.formatErroredRow(theme, { ...row, status: "aborted" }, NOW, false)).startsWith("  ⏹ aborted"));
+	});
+	it("pure filter: fresh failed surfaced; old, superseded and completed not", () => {
+		const failedVerifier = { ...base, status: "failed", finishedAt: NOW - 30_000, error: "boom" } as any;
+		const failedBuilder = { ...base, episodeId: "f-b", agent: "builder", status: "failed", finishedAt: NOW - 30_000 } as any;
+		const failedOld = { ...base, episodeId: "f-old", status: "failed", finishedAt: NOW - (mod.ERROR_ROW_TTL_MS + 60_000) } as any;
+		const completed = { ...base, episodeId: "f-done", status: "completed", finishedAt: NOW - 30_000 } as any;
+		const retryVerifier = { ...base, episodeId: "r", status: "running", startedAt: NOW - 10_000 } as any;
+		const staleRetry = { ...base, episodeId: "r2", status: "running", startedAt: NOW - 5 * 60_000 } as any;
+		const rows = [failedVerifier, failedBuilder, failedOld, completed];
+		assert.deepEqual(mod.recentErroredRows(rows, NOW, [retryVerifier]).map((r: any) => r.episodeId), ["f-b"], "retry of the same role suppresses only its own stale error row");
+		assert.deepEqual(mod.recentErroredRows(rows, NOW, []).map((r: any) => r.episodeId), ["f", "f-b"], "TTL + status filter otherwise");
+		assert.deepEqual(mod.recentErroredRows(rows, NOW, [staleRetry]).map((r: any) => r.episodeId), ["f", "f-b"], "a retry that predates the failure does not suppress it");
+	});
+	it("renderWidget surfaces a 30s-old failure under its goal; expired and superseded stay hidden", async () => {
+		const db = createFixtureDb([
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "goal_record", stage: "goal_receipt", owner: "verifier", body: '{"title":"Died Goal"}', createdAt: 1_760_000_001 }),
+		]);
+		const { binPath, dispose: disposeBin } = installFixtureBin();
+		const { pi } = await loadExtension();
+		const dir = mkdtempSync(join(tmpdir(), "atp-errw-"));
+		const manifest = join(dir, "manifest.jsonl");
+		const session = join(dir, "child.jsonl");
+		try {
+			const sid = (i: number) => `${String(i).repeat(8)}-aaaa-4aaa-8aaa-${String(i).repeat(12)}`;
+			// fresh failure ~30s old, attached to the verifier-owned goal
+			writeFileSync(
+				manifest,
+				[
+					JSON.stringify({ type: "started", episodeId: "ep-w-err", sessionId: sid(1), agent: "verifier", sessionFile: session, startedAt: new Date(Date.now() - 5 * 60_000).toISOString() }),
+					JSON.stringify({ type: "finished", episodeId: "ep-w-err", status: "failed", error: "Child subagent finished without an assistant response.", finishedAt: new Date(Date.now() - 30_000).toISOString() }),
+				].join("\n") + "\n",
+			);
+			assert.equal(mod.pollManifest(manifest), true);
+			await withEnv(testEnv({ EDEN_MEMORY_DB: db.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const joined = (captured.setWidget["atp-board"] ?? []).map(strip).join("\n");
+				assert.ok(joined.includes("✗ failed · Child subagent finished without an assistant response."), `transient ✗ line: ${JSON.stringify(joined.slice(0, 400))}`);
+				assert.ok(joined.includes(" ago"), "age shown");
+			});
+			pi.__emit("session_shutdown");
+			// TTL-expired failure → hidden again
+			writeFileSync(
+				manifest,
+				[
+					JSON.stringify({ type: "started", episodeId: "ep-w-old", sessionId: sid(2), agent: "verifier", sessionFile: session, startedAt: new Date(Date.now() - 20 * 60_000).toISOString() }),
+					JSON.stringify({ type: "finished", episodeId: "ep-w-old", status: "failed", error: "boom", finishedAt: new Date(Date.now() - (mod.ERROR_ROW_TTL_MS + 60_000)).toISOString() }),
+				].join("\n") + "\n",
+			);
+			assert.equal(mod.pollManifest(manifest), true);
+			await withEnv(testEnv({ EDEN_MEMORY_DB: db.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const joined = (captured.setWidget["atp-board"] ?? []).map(strip).join("\n");
+				assert.ok(!joined.includes("✗ failed"), `TTL-expired failure hidden: ${JSON.stringify(joined.slice(0, 400))}`);
+				assert.ok(joined.includes("Died Goal"), "board still renders");
+			});
+			pi.__emit("session_shutdown");
+			// superseded by a newer same-role retry → error hidden, retry shown
+			writeFileSync(
+				manifest,
+				[
+					JSON.stringify({ type: "started", episodeId: "ep-w-sup-f", sessionId: sid(3), agent: "verifier", sessionFile: session, startedAt: new Date(Date.now() - 5 * 60_000).toISOString() }),
+					JSON.stringify({ type: "finished", episodeId: "ep-w-sup-f", status: "failed", error: "boom", finishedAt: new Date(Date.now() - 30_000).toISOString() }),
+					JSON.stringify({ type: "started", episodeId: "ep-w-sup-r", sessionId: sid(4), agent: "verifier", sessionFile: session, startedAt: new Date(Date.now() - 10_000).toISOString() }),
+				].join("\n") + "\n",
+			);
+			assert.equal(mod.pollManifest(manifest), true);
+			await withEnv(testEnv({ EDEN_MEMORY_DB: db.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const joined = (captured.setWidget["atp-board"] ?? []).map(strip).join("\n");
+				assert.ok(!joined.includes("✗"), `superseded failure hidden: ${JSON.stringify(joined.slice(0, 400))}`);
+				assert.ok(joined.includes("starting…"), "retry row visible");
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			disposeBin();
+			db.dispose();
+			pi.__emit("session_shutdown");
+		}
+	});
+});
