@@ -98,6 +98,26 @@ mkdir -p /tmp/atp-bench && rm -f /tmp/atp-bench/bench.db
 sqlite3 ~/.eden-memory/default.db "SELECT json_extract(metadata,'$.record_type'), count(*) FROM memories WHERE workspace_id='<ws>' AND deleted_at=0 AND json_extract(metadata,'$.goal_id') IS NOT NULL GROUP BY 1 ORDER BY 2 DESC;"
 ```
 
+## Interim measurement (2026-09-06 ~14:30 local, post-change)
+
+First goals run after the speed changes landed (atp-rebrand-wave3 /
+atp-rebrand-wave4-compound, 14 role runs): the role-subagent files load at
+spawn time, so those subagents already used the new protocol — but the
+PARENT session predates it, so the router fast-path was not exercised.
+
+| Metric | Baseline | Wave3/Wave4 | Verdict |
+|--------|----------|-------------|---------|
+| run_logs per goal | 8 | **4** (start-only; no turn-end run_logs in any role trail) | ✅ turn-end merge landed |
+| bookkeeping records per goal (abs.) | 15–20 | 11 | ✅ down |
+| hand_offs per goal | 7–12 | 7 (unchanged — by design) | — |
+| router passes per goal | 5–7 | 3 (one per transition — parent not reloaded) | ⏳ fast-path not yet exercised |
+| router avg duration | ~80s | ~115s (n=6, high variance) | watch |
+| goal wall-clock | 27–35m | 30m / 47m (researcher 24m + verifier 9m real work) | not comparable — scope differs |
+
+**Assessment:** turn-end merge = landed and visible in every role trail.
+Router fast-path = pending the first parent session started (or reloaded)
+after 8ce295d. Re-measure router-passes-per-goal then; expect ~3 → ~1–2.
+
 ## Changes measured against this baseline
 
 | Change | Expected effect |
