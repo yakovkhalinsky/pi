@@ -139,6 +139,10 @@ Spawn the `router` subagent (or invoke `/team-continue ${GOAL_ID}`) when:
 
 The parent assistant must not ask "Shall I proceed?" or otherwise wait for user confirmation between normal lifecycle transitions.
 
+### Subagent spawn & resume narration discipline
+
+Every `subagent` / `subagent_resume` tool call must appear in an assistant message that also carries user-visible text — never a silent, text-less (think-only) tool call. A resume after a failed child run must state: the role that died, the child session id (short id ok), the error cause, and the continuation it is issuing. This also applies when resuming after the extension's auto-recovery steer (the ATP extension queues a steer on subagent stream dropouts — "Child subagent finished without an assistant response" — instructing exactly this narrated resume; it auto-recovers each dead child session at most once, then surfaces an escalation to the user instead of retrying).
+
 ### Parent assistant continuation checklist
 
 1. Read the latest Eden-memory record for the `goal_id` (cheap status read).
@@ -146,6 +150,7 @@ The parent assistant must not ask "Shall I proceed?" or otherwise wait for user 
 3. If it names a valid `next_role` (router fast-path conditions met), spawn that role directly.
 4. Otherwise spawn the `router` subagent or invoke `/team-continue ${GOAL_ID}`.
 5. Do not ask "Shall I proceed?" between normal lifecycle transitions.
+6. Narrate every subagent/subagent_resume spawn in the same assistant message (see "Subagent spawn & resume narration discipline").
 
 For cross-session or cross-role transfers, the transferring role (or the Router when continuing) must also write a `hand_off_record`.
 
@@ -313,7 +318,8 @@ If a new `action_record` is stored after an `archival_record` for the same `goal
 
   (`team_remember`/the extension write the aligned identity line automatically; the numbered CLI edit applies to raw `eden.sh`/`eden-memory` usage.)
 - **`search` requires `--agent-id`.** The `eden.sh` wrapper only passes it when given; pass the role name explicitly or search fails (`--agent-id, --user-id, and --keywords are required`). The wrapper's default `--agent-id` handling is being fixed in `eden.sh` by the parallel tooling goal `atp-tooling-hardening-2026-09-04`; do not patch the wrapper from a spec goal (F6d).
-- **Child-stream deaths are visible, not silent (2026-09-06).** Model-stream deaths on long child runs (observed: glm-5.3-flash researcher/verifier children) end in a thinking-stub transcript entry followed by zero writes; the manifest does carry `finished` records with `status: "failed"` + an `error` string, and the parent's errored `tool_result` (details: null) carries `Subagent session ID:`. The widget now renders `⚠ stalled?` for the silent window and transient ✗ error lines for died runs; a true manifest orphan (started, no finished record) would render as stalled only — protocol side still owes an orphan-possibility check.
+- **Child-stream deaths are visible, not silent (2026-09-06).** Model-stream deaths on long child runs (observed: glm-5.3-flash researcher/verifier children) end in a thinking-stub transcript entry followed by zero writes; the manifest does carry `finished` records with `status: "failed"` + an `error` string, and the parent's errored `tool_result` (details: null) carries `Subagent session ID:`. The widget now renders `⚠ stalled?` for the silent window and transient ✗ error lines for died runs; the extension auto-recovers one narrated resume per dead child session (scope C9).
+- **Manifest invariants — no orphan-close code needed (verified 2026-09-06, pi-submarine 0.2.0).** All three on-disk manifests showed zero true orphans: every `started` (keyed by `episodeId`) gets a terminal `finished` — including failed runs, which carry `status: "failed"` + an `error` string (pi-submarine's catch path writes `failRun` before rethrowing, so stream death still lands a terminal record). `resume_finished` entries pair with their run by **sessionId**, not episodeId, and carry a fresh episodeId per resume — last resume wins for liveness. A theoretical orphan (started with no terminal record) is only possible on SIGKILL of the whole parent process mid-run; do not add reconcile-close logic for it.
 - **`lookup` is user/org/workspace-scoped.** The same id in another workspace returns `found: false` — first check which workspace a record actually lives in before concluding it is missing.
 - **Pin the workspace explicitly.** `WORKSPACE_ID` defaults to the cwd basename; subagents spawned from a different cwd (or a parent whose workspace differs from the repo basename) silently read/write a different memory scope. Pass the memory workspace in every subagent task prompt and export it before any memory call.
 - **Empty id = failed write.** The wrapper hides CLI stderr (`2>/dev/null`); transient SQLITE_BUSY/embedding failures return an empty id. Check every captured id is non-empty and retry before proceeding. (`forget --id` exists for probe/temp record cleanup; do not invoke `eden-memory` bare — it starts an MCP stdio server.)

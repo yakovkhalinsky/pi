@@ -4,13 +4,15 @@ Scoping for automated tests over the Agentic Team Protocol stack: **protocol
 adherence**, **memory hygiene**, and **UI display & interaction**.
 
 Status: scope approved. **All milestones landed — M1–M5, plus F7 (closed-goal
-removal, 2026-09-06) and F5b-adjacent dropout visibility (stall marker +
-transient errored rows in widget-poller, 2026-09-06)** (193/193 green ~8s offline;
-+3 e2e green with `ATP_E2E=1`): `tests/atp/` — harness + smoke (M1),
+removal, 2026-09-06), F5b-adjacent dropout visibility (stall marker +
+transient errored rows in widget-poller, 2026-09-06), and C10 dropout
+auto-recovery (narrated resume steer + max-1 budget, 2026-09-06)** (211/211
+green ~8s offline; +3 e2e green with `ATP_E2E=1`): `tests/atp/` — harness + smoke (M1),
 protocol-state / protocol-io / dbpinning-{probe,hijack,override} / scoping-workspace /
 sql-scoping (M2), ui-board / ui-cards / ui-text (M3), eden-sh / tool-surface /
 genericity (M4), widget-poller / steer-ux / commands-board / e2e-real-cli (M5),
-purge-closed (F7: team_purge / /team-purge, board default views).
+purge-closed (F7: team_purge / /team-purge, board default views),
+auto-recovery (C10: dropout detection, budget, narrated-resume steer).
 
 Runner: `node --test tests/atp/*.test.ts` (Node ≥23 native TS type-stripping;
 repo-root `node_modules/` symlinks via `tests/setup.sh`). T3 real-CLI e2e is
@@ -24,7 +26,7 @@ hardcoded or printed).
 
 | Unit | Path | Size |
 |------|------|------|
-| ATP extension (tools, commands, widget, poller) | `~/.pi/agent/extensions/agentic-team-protocol/index.ts` (mirrored at `agent/extensions/…`) | ~2,980 lines |
+| ATP extension (tools, commands, widget, poller) | `~/.pi/agent/extensions/agentic-team-protocol/index.ts` (mirrored at `agent/extensions/…`) | ~3,215 lines |
 | Eden-memory CLI wrapper | `~/.pi/agent/skills/agentic-team-protocol/eden.sh` (mirrored at `agent/skills/…`) | 278 lines |
 | Role agents / prompt templates | `~/.pi/agent/{agents,prompts}/` | 7 + 7 files (protocol *text* — out of automated scope) |
 | Eden-memory CLI | `~/.local/bin/eden-memory` (v0.3.x) | external; exercised via stub + real-CLI tiers |
@@ -58,7 +60,7 @@ Verified facts this scope relies on:
 
 ### Seams (three, in order of preference)
 
-1. **Pure-function unit seam** — `index.ts`'s ~25 module-private pure helpers
+1. **Pure-function unit seam** — `index.ts`'s ~30 module-private pure helpers
    (`classifyState`, `summarizeGoals`, `findStrandedPending`, `parseRecord`,
    `stripIdentity`, `tailJsonl`, …) get a test-only export block at the bottom
    of `index.ts` (add `export` keywords / an `export { … }` statement — zero
@@ -358,6 +360,16 @@ failure; the retry loop is eden.sh's (B1-2).
 |----|------|
 | C9-1 | `/team-board` outside interactive mode → "requires interactive mode" error, no overlay |
 | C9-2 | all five tools with missing org id → `failMissingOrg` loud error, zero CLI invocations observed |
+
+### C10. Dropout auto-recovery (T1/T2, 2026-09-06)
+
+| ID | Case |
+|----|------|
+| C10-1 | `detectEmptyResponseDropout`: errored subagent result with the pi-submarine stream-dropout marker ("Child subagent finished without an assistant response.") + `Subagent session ID:` line detected with agent name; other errors, non-error results, and id-less dropout text rejected; `details.run.sessionId` fallback when the id line is missing; toolName filter keeps non-subagent results out |
+| C10-2 | `extractSessionIdFromErrorText` parses `Subagent session ID: <uuid>`; null without the id line |
+| C10-3 | budget `shouldAutoRecover`: first attempt allowed, second denied; `MAX_AUTO_RECOVERY_PER_SESSION = 1` |
+| C10-4 | `buildRecoverySteerMessage` names the dead child + session id, carries the marker, demands visible narration in the same assistant message (`subagent_resume` named, "Never resume silently"), states the stop condition ("do not retry", "one attempt") |
+| C10-5 | `tool_result` wiring: first dropout → ONE `sendUserMessage` steer with `deliverAs: "steer"` + `atp.auto_recovery` entry; second dropout on the same child session → no steer, `atp.auto_recovery_exhausted` entry + user warning (budget exhausted); works without UI (headless); `subagent_resume` dropouts recover through the same path; `session_shutdown` clears the budget so a fresh session recovers again |
 
 ---
 

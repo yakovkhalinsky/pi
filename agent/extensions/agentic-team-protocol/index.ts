@@ -223,6 +223,17 @@ interface SteerRecord {
 }
 
 const subagentRows = new Map<string, SubagentRow>(); // by episodeId
+
+// --- Dropout auto-recovery (scope C10): when a subagent/subagent_resume result
+// fails with pi-submarine's stream-dropout error ("Child subagent finished
+// without an assistant response."), queue ONE narrated-recovery steer per dead
+// child session id via pi.sendUserMessage({ deliverAs: "steer" }) so the parent
+// issues a narrated subagent_resume. Loop guard: max 1 auto-recovery per child
+// session id (counts cleared only on session_shutdown, never reset mid-run);
+// further failures escalate to the user instead of retrying.
+const EMPTY_RESPONSE_MARKER = "Child subagent finished without an assistant response.";
+const MAX_AUTO_RECOVERY_PER_SESSION = 1;
+const autoRecoveryCounts = new Map<string, number>(); // by child sessionId
 const manifestOffsets = new Map<string, { offset: number; remainder: string }>();
 const sessionTails = new Map<string, { offset: number; remainder: string; activity: string }>();
 let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -427,6 +438,50 @@ function reconcileErroredSubagentResult(event: {
 		}
 	}
 	return n;
+}
+
+// --- Dropout auto-recovery pure helpers (scope C10; test-only exported) ---
+
+/** Pull the child session id out of an errored subagent result body —
+ * pi-submarine's recoverable-error render ends with `Subagent session ID: <uuid>`. */
+function extractSessionIdFromErrorText(text: string): string | null {
+	const m = /Subagent session ID:\s*([0-9a-f-]+)/i.exec(text);
+	return m ? m[1] : null;
+}
+
+/** Detect a stream-dropout failure in a subagent/subagent_resume tool_result:
+ * isError + the empty-response marker in the result text + a discoverable
+ * child session id (error text first, `details.run.sessionId` fallback). */
+function detectEmptyResponseDropout(event: {
+	isError?: boolean;
+	content?: Array<{ type?: string; text?: string }> | string;
+	details?: { run?: SubagentRunViewLite };
+}): { sessionId: string; agent?: string } | null {
+	if (!event?.isError) return null;
+	const text = Array.isArray(event.content) ? event.content.map((b) => b?.text ?? "").join("\n") : event.content || "";
+	if (!text.includes(EMPTY_RESPONSE_MARKER)) return null;
+	const sessionId = extractSessionIdFromErrorText(text) ?? event.details?.run?.sessionId ?? null;
+	if (!sessionId) return null;
+	const agent = /##\s+Subagent\s+(\S+)\s+error/.exec(text)?.[1] ?? event.details?.run?.agent;
+	return { sessionId, agent };
+}
+
+/** Budget guard: each dead child session gets at most one auto-recovery. */
+function shouldAutoRecover(counts: Map<string, number>, sessionId: string): boolean {
+	return (counts.get(sessionId) ?? 0) < MAX_AUTO_RECOVERY_PER_SESSION;
+}
+
+/** Steer text sent to the parent after a detected dropout: names the dead
+ * child, demands visible narration in the same assistant message as the
+ * subagent_resume call, and stops on a second identical failure. */
+function buildRecoverySteerMessage(agent: string | undefined, sessionId: string): string {
+	const label = agent ? `Subagent ${agent}` : `Subagent session ${shortId(sessionId)}`;
+	return [
+		`ATP auto-recovery: ${label} (${shortId(sessionId)}) died with a stream dropout — "${EMPTY_RESPONSE_MARKER}".`,
+		`In THIS assistant message: narrate the dropout in one visible line (which child died, why), then call subagent_resume with sessionId "${sessionId}" and a continuation message telling the child its previous turn ended without a final assistant response, to verify its durable records are written and return its final answer now.`,
+		"Never resume silently: the resume tool call must carry user-visible narration text in the same assistant message.",
+		`If the resume fails again with "${EMPTY_RESPONSE_MARKER}", do not retry — report the failure and surface it to the user (auto-recovery budget is one attempt).`,
+	].join("\n");
 }
 
 /** A running row stalls when its last transcript write is a death signature (thinking stub / never-started) and nothing was written since. Pending tool calls (`→ tool`), tool-result states (`✓/✗ tool`) and text replies are exempt — long healthy tool calls reach 14+ min of silence. */
@@ -2990,8 +3045,47 @@ export default function (pi: ExtensionAPI) {
 	// --- Lifecycle UX: always-visible board widget (plain sight, no overlays)
 	// Reconciles authoritative run state from subagent/subagent_resume results
 	// and renders goal board + live subagent rows + needs-you + steer queue.
+	// Also the dropout auto-recovery intercept (works in every mode — it repairs
+	// the agent loop, it is not a UI feature).
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.toolName !== "subagent" && event.toolName !== "subagent_resume") return;
+		try {
+			// Dropout auto-recovery (scope C10): stream-dropout failure → ONE narrated
+			// resume steer per dead child session id; budget exhausted → escalate.
+			const dropout = detectEmptyResponseDropout(event as {
+				isError?: boolean;
+				content?: Array<{ type?: string; text?: string }> | string;
+				details?: { run?: SubagentRunViewLite };
+			});
+			if (dropout && shouldAutoRecover(autoRecoveryCounts, dropout.sessionId)) {
+				autoRecoveryCounts.set(dropout.sessionId, (autoRecoveryCounts.get(dropout.sessionId) ?? 0) + 1);
+				pi.sendUserMessage(buildRecoverySteerMessage(dropout.agent, dropout.sessionId), { deliverAs: "steer" });
+				try {
+					pi.appendEntry("atp.auto_recovery", {
+						sessionId: dropout.sessionId,
+						agent: dropout.agent ?? null,
+						attempt: autoRecoveryCounts.get(dropout.sessionId),
+						at: new Date().toISOString(),
+					});
+				} catch {
+					/* entry is observability only */
+				}
+			} else if (dropout) {
+				const msg = `ATP auto-recovery budget exhausted for ${dropout.agent ?? "subagent"} (${shortId(dropout.sessionId)}) — manual subagent_resume needed`;
+				if (ctx?.hasUI) ctx.ui.notify(msg, "warning");
+				try {
+					pi.appendEntry("atp.auto_recovery_exhausted", {
+						sessionId: dropout.sessionId,
+						agent: dropout.agent ?? null,
+						at: new Date().toISOString(),
+					});
+				} catch {
+					/* entry is observability only */
+				}
+			}
+		} catch {
+			/* never let recovery UX break the agent loop */
+		}
 		if (ctx.mode !== "tui" || !ctx.hasUI) return;
 		try {
 			const details = (event as { details?: { run?: SubagentRunViewLite } }).details;
@@ -3018,6 +3112,7 @@ export default function (pi: ExtensionAPI) {
 		stopPoller();
 		pollCtx = undefined;
 		subagentRows.clear();
+		autoRecoveryCounts.clear();
 		manifestOffsets.clear();
 		sessionTails.clear();
 		widgetDirty = false;
@@ -3104,6 +3199,13 @@ export {
 	fetchSteers,
 	writeSteer,
 	consumePendingSteers,
+	// dropout auto-recovery (scope C10)
+	EMPTY_RESPONSE_MARKER,
+	MAX_AUTO_RECOVERY_PER_SESSION,
+	extractSessionIdFromErrorText,
+	detectEmptyResponseDropout,
+	shouldAutoRecover,
+	buildRecoverySteerMessage,
 	// closed-goal removal (team_purge / /team-purge)
 	purgeClosedGoals,
 	purgeSummaryLines,

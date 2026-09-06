@@ -79,6 +79,14 @@ export function createMockPi({ exec = execRun }: { exec?: Function } = {}) {
 			listeners.set(event, arr);
 		},
 		exec: (cmd: string, args: string[], opts?: any) => exec(cmd, args, opts ?? {}),
+		sentUserMessages: [] as { content: any; opts: any }[],
+		appendEntries: [] as { customType: string; data: any }[],
+		sendUserMessage: (content: any, opts?: any) => {
+			pi.sentUserMessages.push({ content, opts });
+		},
+		appendEntry: (customType: string, data?: any) => {
+			pi.appendEntries.push({ customType, data });
+		},
 	};
 	/** Fire registered handlers, e.g. __emit("session_start", event, ctx). */
 	pi.__emit = async (event: string, ...args: any[]) => {
