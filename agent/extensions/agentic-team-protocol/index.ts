@@ -199,6 +199,8 @@ interface SubagentRow {
 	turns: number;
 	lastActivity: string;
 	sessionFile?: string;
+	lastEventAt?: number; // epoch ms of the newest child-jsonl write seen (stall detection)
+	error?: string; // manifest/tool_result error text (failed/aborted rows)
 }
 
 /** Mirror of pi-submarine's SubagentRunView (arrives in tool_result details). */
@@ -227,6 +229,7 @@ let pollTimer: ReturnType<typeof setInterval> | undefined;
 let pollInFlight = false;
 let pollCtx: ExtensionContext | undefined;
 let widgetDirty = false;
+let erroredWasVisible = false; // re-render once more after the last ✗ row's TTL expires
 
 /** Read bytes appended to filePath since offset. Handles truncation. */
 function readNewBytes(filePath: string, offset: number): { chunk: string; nextOffset: number } {
@@ -279,7 +282,7 @@ function pollManifest(manifestPath: string): boolean {
 	if (records.length === 0) return false;
 	let changed = false;
 	for (const raw of records) {
-		const rec = raw as { type?: string; episodeId?: string; sessionId?: string; parentEpisodeId?: string | null; agent?: string; sessionFile?: string; startedAt?: string; status?: string; finishedAt?: string };
+		const rec = raw as { type?: string; episodeId?: string; sessionId?: string; parentEpisodeId?: string | null; agent?: string; sessionFile?: string; startedAt?: string; status?: string; finishedAt?: string; error?: string };
 		if (!rec?.episodeId) continue;
 		const isStart = rec.type === "started" || rec.type === "resume_started";
 		const isFinish = rec.type === "finished" || rec.type === "resume_finished";
@@ -297,6 +300,7 @@ function pollManifest(manifestPath: string): boolean {
 					turns: 0,
 					lastActivity: "starting…",
 					sessionFile: rec.sessionFile,
+					lastEventAt: startedMs,
 				};
 				subagentRows.set(rec.episodeId, row);
 				changed = true;
@@ -304,6 +308,8 @@ function pollManifest(manifestPath: string): boolean {
 				row.status = "running";
 				row.startedAt = startedMs;
 				row.finishedAt = undefined;
+				row.error = undefined; // a resume is a fresh chance
+				row.lastEventAt = startedMs;
 				changed = true;
 			}
 		} else if (isFinish && row) {
@@ -313,6 +319,7 @@ function pollManifest(manifestPath: string): boolean {
 			if (row.status !== nextStatus) changed = true;
 			row.status = nextStatus;
 			row.finishedAt = rec.finishedAt ? Date.parse(rec.finishedAt) || Date.now() : Date.now();
+			row.error = rec.error;
 			// Stop tailing this child.
 			if (row.sessionFile) sessionTails.delete(row.sessionFile);
 		}
@@ -352,6 +359,13 @@ function pollChildSessions(): void {
 			sessionTails.set(row.sessionFile, tail);
 		}
 		const entries = tailJsonl(row.sessionFile, tail);
+		if (entries.length > 0) {
+			// ANY new entry is churn — even ones describeSessionEntry ignores
+			// (user prompts). Stall detection keys off the newest transcript write.
+			const last = entries[entries.length - 1] as { timestamp?: string };
+			const t = last?.timestamp ? Date.parse(last.timestamp) : NaN;
+			row.lastEventAt = Math.max(row.lastEventAt ?? 0, Number.isNaN(t) ? Date.now() : t);
+		}
 		for (const entry of entries) {
 			const d = describeSessionEntry(entry);
 			if (!d) continue;
@@ -378,9 +392,49 @@ function reconcileRunFromDetails(run: SubagentRunViewLite | undefined, parentEpi
 	row.status = run.status;
 	row.turns = run.turnCount ?? row.turns;
 	row.lastActivity = run.activity || row.lastActivity;
+	if (run.status === "running") row.lastEventAt = Date.now();
 	if (run.status !== "running") row.finishedAt = row.finishedAt ?? Date.now();
 	subagentRows.set(run.episodeId, row);
 	for (const child of run.children ?? []) reconcileRunFromDetails(child, run.episodeId);
+}
+
+/**
+ * Died-child reconcile for the details:null hole: on child death the parent's
+ * subagent tool_result carries isError: true, details: null and a text body
+ * ending in `Subagent session ID: <id>`. Flip the matching running row to
+ * failed so it surfaces as a transient ✗ line even if the manifest finished
+ * record is late/missing. Returns the number of rows flipped.
+ */
+function reconcileErroredSubagentResult(event: {
+	isError?: boolean;
+	content?: Array<{ type?: string; text?: string }> | string;
+}): number {
+	if (!event?.isError) return 0;
+	const text = Array.isArray(event.content) ? event.content.map((b) => b?.text ?? "").join("\n") : event.content || "";
+	const m = /Subagent session ID:\s*([0-9a-f-]+)/i.exec(text);
+	if (!m) return 0;
+	// Prefer the human error sentence over the `## Subagent <agent> error` heading.
+	const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+	const firstLine = lines.find((l) => !l.startsWith("#")) ?? lines[0] ?? "failed";
+	let n = 0;
+	for (const row of subagentRows.values()) {
+		if (row.status === "running" && row.sessionId === m[1]) {
+			row.status = "failed";
+			row.finishedAt = Date.now();
+			row.error = firstLine;
+			if (row.sessionFile) sessionTails.delete(row.sessionFile);
+			n++;
+		}
+	}
+	return n;
+}
+
+/** A running row stalls when its last transcript write is a death signature (thinking stub / never-started) and nothing was written since. Pending tool calls (`→ tool`), tool-result states (`✓/✗ tool`) and text replies are exempt — long healthy tool calls reach 14+ min of silence. */
+const STALL_AFTER_MS = 3 * 60_000;
+function isStalled(row: SubagentRow, now: number): boolean {
+	if (row.status !== "running") return false;
+	const silentMs = now - (row.lastEventAt ?? row.startedAt);
+	return silentMs > STALL_AFTER_MS && ["thinking", "starting…", ""].includes(row.lastActivity);
 }
 
 function fmtElapsed(ms: number): string {
@@ -398,16 +452,50 @@ function sortedSubagentRows(): SubagentRow[] {
 	});
 }
 
-function formatSubagentRow(theme: Theme, row: SubagentRow): string {
+/** Failed/aborted runs younger than this surface transiently as ✗ lines on the widget. */
+const ERROR_ROW_TTL_MS = 2 * 60_000;
+/**
+ * Died runs that deserve a transient ✗ line: failed/aborted inside the TTL,
+ * suppressed early once a newer run of the same role spawns (retry in flight
+ * → the error row is stale). Completed rows stay hidden (terminal state lives
+ * on the board's goal rows).
+ */
+function recentErroredRows(rows: SubagentRow[], now: number, running: SubagentRow[]): SubagentRow[] {
+	return rows.filter(
+		(r) =>
+			(r.status === "failed" || r.status === "aborted")
+			&& now - (r.finishedAt ?? 0) < ERROR_ROW_TTL_MS
+			&& !running.some((k) => k.agent === r.agent && k.startedAt > (r.finishedAt ?? 0)),
+	);
+}
+
+function formatSubagentRow(theme: Theme, row: SubagentRow, now: number = Date.now()): string {
 	const depth = row.parentEpisodeId && subagentRows.has(row.parentEpisodeId) ? 1 : 0;
 	const indent = depth > 0 ? "  ↳ " : "";
-	const elapsed = fmtElapsed((row.finishedAt ?? Date.now()) - row.startedAt);
 	const label = theme.fg("text", theme.bold(row.agent));
 	if (row.status === "running") {
+		if (isStalled(row, now)) {
+			const silent = fmtElapsed(now - (row.lastEventAt ?? row.startedAt));
+			return `${indent}${theme.fg("success", "●")} ${label} ${theme.fg("warning", "⚠ stalled?")} ${theme.fg("muted", `· ${row.lastActivity || "working"}`)} ${theme.fg("dim", `· ${row.turns} turns · silent ${silent}`)}`;
+		}
+		const elapsed = fmtElapsed(now - row.startedAt);
 		return `${indent}${theme.fg("success", "●")} ${label} ${theme.fg("muted", `· ${row.lastActivity || "working"}`)} ${theme.fg("dim", `· ${row.turns} turns · ${elapsed}`)}`;
 	}
 	const mark = row.status === "completed" ? theme.fg("success", "✓") : theme.fg("error", row.status === "aborted" ? "⏹" : "✗");
-	return `${indent}${mark} ${label} ${theme.fg("dim", `· ${row.status} · ${row.turns} turns · ${elapsed}`)}`;
+	const err = row.error ? ` · ${clip(row.error, 60)}` : "";
+	return `${indent}${mark} ${label} ${theme.fg("dim", `· ${row.status}${err} · ${row.turns} turns · ${fmtElapsed((row.finishedAt ?? now) - row.startedAt)}`)}`;
+}
+
+/**
+ * Transient ✗ line for a recently failed/aborted run, rendered first under its
+ * goal (or loose with the role name) so a died child is never silent.
+ */
+function formatErroredRow(theme: Theme, row: SubagentRow, now: number, loose: boolean): string {
+	const age = `${fmtElapsed(Math.max(0, now - (row.finishedAt ?? now)))} ago`;
+	const mark = theme.fg("error", row.status === "aborted" ? "⏹" : "✗");
+	const err = row.error ? ` · ${clip(row.error, 60)}` : "";
+	if (loose) return `${mark} ${theme.fg("text", theme.bold(row.agent))} ${theme.fg("dim", `· ${row.status}${err} · ${age}`)}`;
+	return `  ${mark} ${theme.fg("dim", `${row.status}${err} · ${age}`)}`;
 }
 
 /** Queued steer_request records for this workspace (oldest first). */
@@ -551,8 +639,14 @@ function themelessSteerLine(goalId: string, role: string, message: string): stri
  * only status dot, activity, turns, and elapsed. Nested children indent under
  * their parent run.
  */
-function formatGoalActivityLine(theme: Theme, row: SubagentRow, isChild: boolean): string {
-	const elapsed = fmtElapsed((row.finishedAt ?? Date.now()) - row.startedAt);
+function formatGoalActivityLine(theme: Theme, row: SubagentRow, isChild: boolean, now: number = Date.now()): string {
+	if (isStalled(row, now)) {
+		const silent = fmtElapsed(now - (row.lastEventAt ?? row.startedAt));
+		const stalled = `${theme.fg("warning", "⚠ stalled?")} · ${row.lastActivity || "working"} ${theme.fg("dim", `· ${row.turns} turns · silent ${silent}`)}`;
+		if (isChild) return `    ${theme.fg("dim", "↳ ")}${theme.fg("muted", stalled)}`;
+		return `  ${theme.fg("success", "●")} ${stalled}`;
+	}
+	const elapsed = fmtElapsed((row.finishedAt ?? now) - row.startedAt);
 	const body = `${row.lastActivity || "working"} ${theme.fg("dim", `· ${row.turns} turns · ${elapsed}`)}`;
 	if (isChild) return `    ${theme.fg("dim", "↳ ")}${theme.fg("muted", body)}`;
 	return `  ${theme.fg("success", "●")} ${theme.fg("muted", body)}`;
@@ -597,42 +691,66 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 	const openGoals = goals.filter((g) => g.state !== "closed");
 	const closedCount = goals.length - openGoals.length;
 
-	// Only running runs render: terminal state lives on the board's goal rows,
-	// so lingering "✓ completed" agent rows under the board are pure duplication.
-	const running = sortedSubagentRows().filter((r) => r.status === "running");
+	// Only running runs render as ● activity lines: terminal state lives on the
+	// board's goal rows — except fresh failures, which surface transiently below.
+	const now = Date.now();
+	const allRows = sortedSubagentRows();
+	const running = allRows.filter((r) => r.status === "running");
 	const { attached, loose } = associateRunningRows(goals, running);
+	// Died runs surface transiently (✗ lines first under their goal) so a child
+	// death is never silent; they expire after ERROR_ROW_TTL_MS or when a retry
+	// of the same role spawns.
+	const errored = recentErroredRows(allRows, now, running);
+	const erroredAssoc = associateRunningRows(goals, errored);
 
 	const lines: string[] = [theme.fg("accent", theme.bold(" Goal Board"))];
 	let budget = 6; // total live-agent activity lines on the widget
-	let rendered = 0;
+	let renderedRunning = 0;
+	let renderedErrored = 0;
 	if (openGoals.length > 0) {
 		lines.push(boardHeader(theme, true));
 		for (const g of openGoals) {
 			lines.push(boardRow(theme, g, true));
+			for (const r of erroredAssoc.attached.get(g.goalId) ?? []) {
+				if (budget-- > 0) {
+					renderedErrored++;
+					lines.push(formatErroredRow(theme, r, now, false));
+				}
+			}
 			const runs = attached.get(g.goalId) ?? [];
 			for (const r of runs) {
 				const isChild = r.parentEpisodeId != null && runs.some((p) => p.episodeId === r.parentEpisodeId);
 				if (budget-- > 0) {
-					rendered++;
-					lines.push(formatGoalActivityLine(theme, r, isChild));
+					renderedRunning++;
+					lines.push(formatGoalActivityLine(theme, r, isChild, now));
 				}
 			}
 		}
 	}
-	if (loose.length > 0) {
+	if (erroredAssoc.loose.length > 0 || loose.length > 0) {
 		let blankPushed = false;
+		for (const r of erroredAssoc.loose) {
+			if (budget-- > 0) {
+				if (!blankPushed && goals.length > 0) {
+					lines.push("");
+					blankPushed = true;
+				}
+				renderedErrored++;
+				lines.push(formatErroredRow(theme, r, now, true));
+			}
+		}
 		for (const r of loose) {
 			if (budget-- > 0) {
 				if (!blankPushed && goals.length > 0) {
 					lines.push("");
 					blankPushed = true;
 				}
-				rendered++;
-				lines.push(formatSubagentRow(theme, r));
+				renderedRunning++;
+				lines.push(formatSubagentRow(theme, r, now));
 			}
 		}
 	}
-	const hidden = running.length - rendered;
+	const hidden = running.length - renderedRunning;
 	if (hidden > 0) lines.push(theme.fg("dim", ` …+${hidden} more running agent${hidden === 1 ? "" : "s"}`));
 
 	if (closedCount > 0) {
@@ -657,7 +775,7 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 		}
 	}
 
-	if (openGoals.length === 0 && running.length === 0 && steers.length === 0 && needsYou.length === 0) {
+	if (openGoals.length === 0 && running.length === 0 && errored.length === 0 && steers.length === 0 && needsYou.length === 0) {
 		ctx.ui.setWidget("atp-board", undefined);
 		ctx.ui.setStatus("atp", undefined);
 		return;
@@ -687,7 +805,13 @@ function startPoller(pi: ExtensionAPI): void {
 				}
 				const anyRunning = [...subagentRows.values()].some((r) => r.status === "running");
 				if (anyRunning) pollChildSessions();
-				if (manifestChanged || anyRunning || widgetDirty) {
+				// Keep rendering while transient ✗ rows are visible so their 2-min
+				// TTL (and supersede-by-retry) actually clears on screen.
+				const allRows = [...subagentRows.values()];
+				const erroredVisible = recentErroredRows(allRows, Date.now(), allRows.filter((r) => r.status === "running")).length > 0;
+				const renderNow = manifestChanged || anyRunning || widgetDirty || erroredVisible || erroredWasVisible;
+				erroredWasVisible = erroredVisible;
+				if (renderNow) {
 					widgetDirty = false;
 					await renderWidget(pi, ctx);
 				}
@@ -2872,6 +2996,11 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const details = (event as { details?: { run?: SubagentRunViewLite } }).details;
 			reconcileRunFromDetails(details?.run);
+			if ((event as { isError?: boolean }).isError) {
+				// Died child: error results carry details: null — recover the session
+				// id from the result text and flip the matching running row to failed.
+				reconcileErroredSubagentResult(event as { isError?: boolean; content?: Array<{ type?: string; text?: string }> | string });
+			}
 			widgetDirty = true;
 			await renderWidget(pi, ctx);
 		} catch {
@@ -2892,6 +3021,7 @@ export default function (pi: ExtensionAPI) {
 		manifestOffsets.clear();
 		sessionTails.clear();
 		widgetDirty = false;
+		erroredWasVisible = false;
 		cachedWorkspace = undefined;
 	});
 }
@@ -2957,11 +3087,17 @@ export {
 	describeSessionEntry,
 	pollManifest,
 	pollChildSessions,
+	STALL_AFTER_MS,
+	isStalled,
 	fmtElapsed,
 	sortedSubagentRows,
 	formatSubagentRow,
+	formatErroredRow,
 	formatGoalActivityLine,
 	associateRunningRows,
+	ERROR_ROW_TTL_MS,
+	recentErroredRows,
+	reconcileErroredSubagentResult,
 	themelessSteerLine,
 	renderWidget,
 	// steer delivery (scope C8)
