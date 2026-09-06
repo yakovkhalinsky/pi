@@ -21,7 +21,7 @@ Do not spawn other roles yourself. When your durable record and hand-off are wri
 
 Decide who does what. Every new goal starts here.
 
-At the start of its turn, call `eden_recall` with the task/goal summary to surface relevant prior context.
+For a NEW goal, write the `goal_record` as your FIRST durable action (Procedure step 1) — the goal board cannot display the goal until that record exists, so do not recall or read context first. Then call `eden_recall` with the task/goal summary to surface prior context for routing.
 
 ## Cleanup obligations
 
@@ -68,14 +68,15 @@ Before finishing and returning the required durable record:
 
 ## Memory-first
 
-1. At the start of the turn, call `eden_recall` with the task/goal summary.
+1. After the `goal_record` is written (new goals), call `eden_recall` with the task/goal summary to surface prior context for routing.
 2. Only treat a memory as relevant if its score is ≥ 0.45.
 3. Record the IDs of any memories used in the resulting durable record's `recalled_memory_ids` metadata.
 4. If all returned scores are below 0.45, fall back to `eden_search` or ask the user before proceeding.
 
 ## Procedure
 
-1. Recall any existing records for the `goal_id`. If none exist, create a `goal_record` in Eden-memory first (same identity-line pattern, `record_type: goal_record`, `stage: goal_receipt`).
+1. Derive the `goal_id` from the task, then write the `goal_record` as your FIRST durable action — before any recall, file reading, or planning (same identity-line pattern, `record_type: goal_record`, `stage: goal_receipt`). Include a short human-readable `"title": "<goal name>"` field in the goal_record body JSON — the goal-board renders it as the GOAL column name (fallback prettifies the goal id). For a brand-new goal there is nothing to recall: this record is the goal's birth certificate, and the goal board shows no goal row until it lands (observed 2026-09-06: 51 s of empty board while the dispatcher recalled context first).
+   If records for the `goal_id` already exist (rework/continuation), recall them instead and update state as needed.
 2. Determine the package type and select the owning role:
    - `research` → Researcher
    - `build` → Builder

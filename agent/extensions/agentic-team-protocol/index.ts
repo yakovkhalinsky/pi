@@ -25,6 +25,18 @@
  *   - team_decide succeeds when the goal state is closed: it references the
  *     actual pending record and notes that the router owns continuation.
  *
+ * Defect fixes (2026-09-05, goal atp-smoke-defect-fixes-p1-2026-09-05):
+ *   - team_recall/team_lookup no longer pass the unsupported
+ *     `--include-content` flag (eden-memory v0.3.141 returns full content
+ *     by default, so the flag was dropped, not replaced).
+ *   - A goal classifies as closed only on an archival_record (or an
+ *     archivist hand-off when the goal already has an archival_record);
+ *     mid-flight hand-offs stay continueable instead of rendering closed.
+ *   - Steer delivery is goal-scoped: consumePendingSteers matches the FULL
+ *     goal_id of the calling tool (goal-less calls deliver only unscoped
+ *     steers), steer displays show the full displayGoal() id, and /steer
+ *     refuses ambiguous goal-id prefixes instead of taking the first match.
+ *
  * Command:
  *   - /team-board  — full-width bordered goal board (esc to close)
  *
@@ -32,6 +44,11 @@
  *   On every `subagent` tool_result, a compact goal board is refreshed as a
  *   widget above the editor so the user sees team state update live, without
  *   restyling the (headless) subagent's internal tool calls.
+ *   A mid-flight hand_off_record's `next_role` (known protocol roles only)
+ *   renders as the goal's incoming owner (`→ researcher`) until the target
+ *   role writes its first record: roles write stage records at the END of
+ *   their work, so the handing-off role would otherwise own the board for
+ *   the whole duration of the next stage.
  *
  * Human-readable output (2026-09-04):
  *   - team_lookup's text output is a readable record card, not a JSON dump.
@@ -375,6 +392,7 @@ function formatSubagentRow(theme: Theme, row: SubagentRow): string {
 
 /** Queued steer_request records for this workspace (oldest first). */
 async function fetchSteers(pi: ExtensionAPI, ctx: ExtensionContext | undefined): Promise<SteerRecord[]> {
+	await resolveDbPath(pi, ctx);
 	const cfg = edenConfig(ctx);
 	if (!cfg.orgId) return [];
 	const sql = `SELECT id, created_at, metadata FROM memories WHERE org_id = '${sqlEscape(cfg.orgId)}' AND workspace_id = '${sqlEscape(cfg.workspaceId)}' AND deleted_at = 0 AND json_extract(metadata, '$.record_type') = 'steer_request' AND json_extract(metadata, '$.status') = 'queued' ORDER BY created_at ASC LIMIT 20;`;
@@ -403,6 +421,7 @@ async function writeSteer(
 	ctx: ExtensionContext | undefined,
 	opts: { goalId?: string; role: string; message: string; source: string; workspace?: string },
 ): Promise<{ ok: boolean; recordId?: string; error?: string }> {
+	await resolveDbPath(pi, ctx);
 	const cfg = edenConfig(ctx, opts.workspace);
 	if (!cfg.orgId) return { ok: false, error: missingOrgMessage() };
 	const goalId = opts.goalId ?? "";
@@ -421,6 +440,7 @@ async function writeSteer(
 	const res = await pi.exec(
 		cfg.bin,
 		[
+			"--db", cfg.db,
 			"remember",
 			"--agent-id", "dispatcher",
 			"--user-id", cfg.userId,
@@ -437,7 +457,8 @@ async function writeSteer(
 
 /**
  * Child-side steering consumption: fetch queued steer_request records aimed at
- * this role (or "*"), mark them delivered, and return display lines the caller
+ * this role (or "*") and, when `goalId` is given, scoped to that goal or
+ * unscoped, mark them delivered, and return display lines the caller
  * prepends to its tool result so the steer lands in the child's own transcript.
  */
 async function consumePendingSteers(
@@ -445,10 +466,19 @@ async function consumePendingSteers(
 	ctx: ExtensionContext | undefined,
 	cfg: { orgId: string; workspaceId: string; userId: string; bin: string; db: string },
 	role: string,
+	goalId?: string,
 	signal?: AbortSignal,
 ): Promise<string[]> {
 	if (!cfg.orgId || !role) return [];
-	const sql = `SELECT id, content, metadata FROM memories WHERE org_id = '${sqlEscape(cfg.orgId)}' AND workspace_id = '${sqlEscape(cfg.workspaceId)}' AND deleted_at = 0 AND json_extract(metadata, '$.record_type') = 'steer_request' AND json_extract(metadata, '$.status') = 'queued' AND json_extract(metadata, '$.target_role') IN ('${sqlEscape(role)}', '*') ORDER BY created_at ASC LIMIT 5;`;
+	// Goal scoping (defect D3): a steer queued for goal A must never reach a
+	// role instance working goal B. Calls that declare a goal (team_remember)
+	// receive only their own goal's steers plus unscoped ones; goal-less calls
+	// (team_recall) deliver only unscoped steers — goal-scoped steers wait for
+	// a goal-declaring team_* call, so cross-goal leaks are impossible.
+	const goalCond = goalId
+		? ` AND (json_extract(metadata, '$.goal_id') IS NULL OR json_extract(metadata, '$.goal_id') = '' OR json_extract(metadata, '$.goal_id') = '${sqlEscape(goalId)}')`
+		: ` AND (json_extract(metadata, '$.goal_id') IS NULL OR json_extract(metadata, '$.goal_id') = '')`;
+	const sql = `SELECT id, content, metadata FROM memories WHERE org_id = '${sqlEscape(cfg.orgId)}' AND workspace_id = '${sqlEscape(cfg.workspaceId)}' AND deleted_at = 0 AND json_extract(metadata, '$.record_type') = 'steer_request' AND json_extract(metadata, '$.status') = 'queued' AND json_extract(metadata, '$.target_role') IN ('${sqlEscape(role)}', '*')${goalCond} ORDER BY created_at ASC LIMIT 5;`;
 	let rows: Array<{ id: string; content: string; metadata: string | null }> = [];
 	try {
 		const res = await pi.exec("sqlite3", [cfg.db, "-json", sql], { signal, timeout: 10000 });
@@ -472,6 +502,7 @@ async function consumePendingSteers(
 			await pi.exec(
 				cfg.bin,
 				[
+					"--db", cfg.db,
 					"edit",
 					"--id", r.id,
 					"--user-id", cfg.userId,
@@ -491,7 +522,7 @@ async function consumePendingSteers(
 
 /** Plain-text steer line for tool results (no theme dependency). */
 function themelessSteerLine(goalId: string, role: string, message: string): string {
-	return `⚠ STEERING for ${role}${goalId ? ` (goal ${shortId(goalId, 8)})` : ""}: ${message}`;
+	return `⚠ STEERING for ${role}${goalId ? ` (goal ${displayGoal(goalId)})` : ""}: ${message}`;
 }
 
 /** Compose the always-visible widget: goal board + live subagent rows + needs-you + steer queue. */
@@ -525,7 +556,7 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 		for (const s of steers.slice(0, 3)) {
 			lines.push(
 				theme.fg("warning", `↪ steer→${s.targetRole}`) +
-					theme.fg("dim", `${s.goalId ? ` · ${shortId(s.goalId, 8)}` : ""}: `) +
+					theme.fg("dim", `${s.goalId ? ` · ${displayGoal(s.goalId)}` : ""}: `) +
 					theme.fg("muted", clip(s.message, 70)),
 			);
 		}
@@ -610,8 +641,66 @@ function edenConfig(ctx: ExtensionContext | undefined, workspaceParam?: string):
 		workspaceId = ctx ? basename(ctx.cwd) : basename(process.cwd());
 		workspaceSource = "cwd";
 	}
-	const db = process.env.EDEN_MEMORY_DB || join(homedir(), ".eden-memory", "default.db");
+	const db = process.env.EDEN_MEMORY_DB || resolvedDbPath || join(homedir(), ".eden-memory", "default.db");
 	return { bin, userId, orgId, workspaceId, workspaceSource, db };
+}
+
+// --- DB path resolution — follow the CLI's own resolution -------------------
+
+/**
+ * The eden-memory CLI resolves its DB from a project-level `.env` in cwd
+ * (`EDEN_DB_PATH`) before falling back to ~/.eden-memory/default.db — a
+ * resolution the extension cannot see. A leftover setup fixture once pointed
+ * the CLI at a test DB under /tmp while the board read the default path:
+ * role writes landed in /tmp, the goal board went agents-only (2026-09-06,
+ * workspace eden-memory). The DB path is therefore probed ONCE per session
+ * from the CLI itself (`health` reports the effective `db_path`), and `--db`
+ * is pinned on every extension CLI call with the same value, so board reads
+ * and role writes land in the same file by construction. EDEN_MEMORY_DB
+ * stays an explicit extension-side override (probing is skipped when set).
+ */
+let resolvedDbPath: string | null = null;
+let dbProbeDone = false;
+let dbProbeInFlight: Promise<string | null> | null = null;
+
+async function resolveDbPath(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext | undefined,
+): Promise<string | null> {
+	if (dbProbeDone) return resolvedDbPath;
+	if (process.env.EDEN_MEMORY_DB?.trim()) {
+		// Explicit override wins; probing the CLI would be wasted work.
+		dbProbeDone = true;
+		return null;
+	}
+	if (!dbProbeInFlight) {
+		dbProbeInFlight = (async () => {
+			try {
+				const bin = process.env.EDEN_MEMORY_BIN || "eden-memory";
+				const res = await pi.exec(bin, ["health"], { timeout: 15000 });
+				if (res.code === 0) {
+					const m = res.stdout.match(/"db_path"\s*:\s*"([^"]+)"/);
+					if (m?.[1]) resolvedDbPath = m[1];
+				}
+			} catch {
+				/* fall back to the default path */
+			} finally {
+				dbProbeDone = true;
+				dbProbeInFlight = null;
+			}
+			return resolvedDbPath;
+		})();
+	}
+	return dbProbeInFlight;
+}
+
+/** ` · db ~/path/to.db` when the resolved DB is not the default location. */
+function dbHint(cfg: EdenConfig): string {
+	const def = join(homedir(), ".eden-memory", "default.db");
+	if (cfg.db === def) return "";
+	const home = homedir();
+	const shown = cfg.db.startsWith(home) ? `~${cfg.db.slice(home.length)}` : cfg.db;
+	return ` · db ${shown}`;
 }
 
 /** Tool failure result for an unconfigured org id (loud + actionable). */
@@ -634,6 +723,8 @@ interface ParsedRecord {
 	owner: string;
 	recordType: string;
 	status: string;
+	/** hand_off_record only: the role ownership transfers to (may be junk/empty). */
+	nextRole: string;
 }
 
 interface DbRow {
@@ -668,6 +759,13 @@ function parseRecord(row: DbRow): ParsedRecord | null {
 	let owner = (md.owner_role as string | undefined) ?? "";
 	const recordType = (md.record_type as string | undefined) ?? "";
 	const status = (md.status as string | undefined) ?? "";
+	// next_role only exists on hand_off_records (structured metadata; older
+	// raw-CLI writes embed the JSON blob in the content — regex fallback).
+	let nextRole = (md.next_role as string | undefined) ?? "";
+	if (!nextRole) {
+		const m = row.content?.match(/"next_role"\s*:\s*"([^"]+)"/);
+		if (m) nextRole = m[1]!;
+	}
 
 	if (!goalId || !stage || !owner) {
 		const m = row.content?.match(IDENTITY_RE);
@@ -690,16 +788,37 @@ function parseRecord(row: DbRow): ParsedRecord | null {
 		owner: owner || row.agent_id || "unknown",
 		recordType,
 		status,
+		nextRole,
 	};
 }
+
+/**
+ * Protocol roles a hand_off_record's `next_role` must name for the board to
+ * treat it as an ownership transfer. Hand-offs also carry junk values
+ * ("closure", "parent_assistant_to_router") or none at all — those are not
+ * activations and are ignored for the incoming-owner display.
+ */
+const ATP_ROLES = new Set([
+	"dispatcher",
+	"researcher",
+	"builder",
+	"runtime",
+	"verifier",
+	"archivist",
+	"router",
+]);
 
 type GoalState = "active" | "blocked" | "pending_authorisation" | "continueable" | "closed";
 
 /**
  * Classify a goal's state from the latest record's type/status/stage,
  * mirroring the SKILL router lifecycle rules (not the stage string alone).
+ * `hasArchival` = the goal has at least one archival_record. A goal is closed
+ * only on an archival_record (or an archivist hand-off that follows one):
+ * every ATP hand_off_record uses stage hand_off_or_closure, so mid-flight
+ * hand-offs (researcher→builder, router→role, …) must stay continueable.
  */
-function classifyState(rec: ParsedRecord): GoalState {
+function classifyState(rec: ParsedRecord, hasArchival = false): GoalState {
 	const status = rec.status.toLowerCase();
 	const type = rec.recordType.toLowerCase();
 	const stage = rec.stage.toLowerCase();
@@ -712,7 +831,8 @@ function classifyState(rec: ParsedRecord): GoalState {
 		if (status.includes("defer")) return "pending_authorisation";
 		return "continueable";
 	}
-	if (type === "archival_record" || stage.includes("hand_off_or_closure") || stage.includes("closure")) return "closed";
+	if (type === "archival_record") return "closed";
+	if (type === "hand_off_record" && rec.owner.toLowerCase() === "archivist" && hasArchival) return "closed";
 	if (type === "verdict") {
 		if (status.includes("green")) return "active"; // -> archivist
 		if (status.includes("red")) return "continueable"; // -> rework
@@ -725,7 +845,11 @@ function classifyState(rec: ParsedRecord): GoalState {
 interface GoalSummary {
 	goalId: string;
 	stage: string;
+	/** Display-only stage label, closure-aware: "Closure" ⟺ state is closed. */
+	stageLabel: string;
 	owner: string;
+	/** Incoming owner while a hand-off is in flight (target role hasn't written yet). */
+	nextOwner?: string;
 	state: GoalState;
 	recordType: string;
 	status: string;
@@ -752,11 +876,41 @@ function summarizeGoals(records: ParsedRecord[], filter?: { goalId?: string; rol
 		// right after an action run_log) wins "latest" deterministically.
 		arr.sort((a, b) => b.createdAt - a.createdAt);
 		const latest = arr[0]!;
+		const hasArchival = arr.some((r) => r.recordType === "archival_record");
+		const state = classifyState(latest, hasArchival);
+		// In-flight hand-off display: roles write their stage record at the END
+		// of their work, so between a hand_off_record and the target role's
+		// first write the board would keep showing the handing-off role as
+		// owner. If the newest hand-off transfers to a known protocol role that
+		// has not produced any record after it yet, show that incoming owner.
+		// Closed goals are excluded — the archivist's closure hand-off (and
+		// junk next_role values like "closure") is not an activation.
+		let nextOwner: string | undefined;
+		if (state !== "closed") {
+			const handOff = arr.find((r) => r.recordType === "hand_off_record");
+			const target = handOff?.nextRole ?? "";
+			if (handOff && ATP_ROLES.has(target) && target !== handOff.owner) {
+				const acted = arr.some(
+					(r) => r.createdAt > handOff.createdAt && (r.owner === target || r.agentId === target),
+				);
+				if (!acted) nextOwner = target;
+			}
+		}
+		const stageLabel =
+			state === "closed" ? "Closure" : latest.stage === "hand_off_or_closure" ? "Hand-off" : humanize(latest.stage);
+		// Feed the goal-title map from the goal_record body (newest wins; arr is
+		// newest-first). Missing/empty titles fall back to prettifyGoalId.
+		const gr = arr.find((r) => r.recordType === "goal_record");
+		const title = gr ? extractGoalTitle(gr) : "";
+		if (title) goalTitles.set(goalId, title);
+		else goalTitles.delete(goalId);
 		summaries.push({
 			goalId,
 			stage: latest.stage,
+			stageLabel,
 			owner: latest.owner,
-			state: classifyState(latest),
+			nextOwner,
+			state,
 			recordType: latest.recordType,
 			status: latest.status,
 			latestRecordId: latest.id,
@@ -859,6 +1013,7 @@ async function fetchGoals(
 	signal: AbortSignal | undefined,
 	filter?: { goalId?: string; role?: string; workspace?: string },
 ): Promise<{ goals: GoalSummary[]; records: ParsedRecord[]; dbError?: string }> {
+	await resolveDbPath(pi, ctx);
 	const cfg = edenConfig(ctx, filter?.workspace);
 	if (!cfg.orgId) {
 		return { goals: [], records: [], dbError: missingOrgMessage() };
@@ -1063,9 +1218,43 @@ function shortId(id: string, n = 8): string {
 	return id ? id.slice(0, n) : "—";
 }
 
-/** Strip the leading "atp-" prefix from goal ids for human display. */
+/** Goal id → short human title, populated by summarizeGoals from goal_record bodies. */
+const goalTitles = new Map<string, string>();
+
+/**
+ * Prettify a raw goal id for display: strip the leading "atp-" prefix and a
+ * trailing -YYYY-MM-DD date stamp, then title-case hyphen-separated words
+ * (letter+digit tokens like p1/t1 become P1/T1).
+ */
+function prettifyGoalId(id: string): string {
+	let t = id.startsWith("atp-") ? id.slice(4) : id;
+	t = t.replace(/-\d{4}-\d{2}-\d{2}$/, ""); // trailing date stamp
+	return t
+		.split("-")
+		.filter(Boolean)
+		.map((w) => (/\d/.test(w) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()))
+		.join(" ");
+}
+
+/**
+ * Extract a short human-readable "title" from a goal_record body JSON
+ * (identity line stripped first). Returns "" when absent or unparsable.
+ */
+function extractGoalTitle(rec: ParsedRecord): string {
+	const raw = stripIdentity(rec.content ?? "").trim();
+	if (!raw.startsWith("{")) return "";
+	try {
+		const v = JSON.parse(raw) as Record<string, unknown>;
+		const t = typeof v.title === "string" ? v.title.trim() : "";
+		return t ? clip(t, 60) : "";
+	} catch {
+		return "";
+	}
+}
+
+/** Goal display name: goal_record "title" if known, else prettified id. */
 function displayGoal(id: string): string {
-	return id.startsWith("atp-") ? id.slice(4) : id;
+	return goalTitles.get(id) ?? prettifyGoalId(id);
 }
 
 /** Latest record body with the identity line stripped (and JSON blobs unwrapped), for decision prompts. */
@@ -1109,8 +1298,15 @@ const COL_COUNTS = 5;
 function boardRow(theme: Theme, g: GoalSummary, compact: boolean): string {
 	const state = padCol(stateTag(theme, g.state), COL_STATE);
 	const goal = goalCol(theme, g.goalId, COL_GOAL);
-	const stage = col(theme, humanize(g.stage), COL_STAGE, "mdCode");
-	const owner = col(theme, g.owner, COL_OWNER, "accent");
+	const stage = col(theme, g.stageLabel, COL_STAGE, "mdCode");
+	// While a hand-off is in flight, the owner column shows the incoming role
+	// (dim arrow + accent role) — ownership has already transferred to it.
+	const owner = g.nextOwner
+		? padCol(
+				theme.fg("dim", "→ ") + theme.fg("accent", truncateToWidth(g.nextOwner, COL_OWNER - 2, "")),
+				COL_OWNER,
+			)
+		: col(theme, g.owner, COL_OWNER, "accent");
 	const counts = padCol(theme.fg("dim", `(${g.recordCount})`), COL_COUNTS);
 	if (compact) return `${state}  ${goal}  ${stage}  ${owner}  ${counts.trimEnd()}`;
 	const rec = col(theme, shortId(g.latestRecordId, COL_RECORD), COL_RECORD, "muted");
@@ -1303,7 +1499,7 @@ export default function (pi: ExtensionAPI) {
 			const pending = goals.filter((g) => g.state === "pending_authorisation" || g.state === "blocked");
 			const goalLines = goals.map(
 				(g) =>
-					`${displayGoal(g.goalId)} | ${humanize(g.stage)} | ${g.owner} | ${g.state} | rec=${shortId(g.latestRecordId)} | ${g.recordCount} records`,
+					`${displayGoal(g.goalId)} | ${g.stageLabel} | ${g.nextOwner ? `${g.owner} → ${g.nextOwner}` : g.owner} | ${g.state} | rec=${shortId(g.latestRecordId)} | ${g.recordCount} records`,
 			);
 			const decisionLines = pending.map(
 				(g) =>
@@ -1314,7 +1510,7 @@ export default function (pi: ExtensionAPI) {
 					`NEEDS HUMAN DECISION (goal closed, ${humanize(s.recordType)}): ${displayGoal(s.goalId)} — ${s.question}. rec=${shortId(s.recordId)}. team_decide goal_id="${s.goalId}" still works on closed goals; the router handles continuation.`,
 			);
 
-			const ws = `workspace ${cfg.workspaceId} (${cfg.workspaceSource})`;
+			const ws = `workspace ${cfg.workspaceId} (${cfg.workspaceSource})${dbHint(cfg)}`;
 			const summaryText = dbError
 				? `Eden-memory db error (${ws}): ${dbError}`
 				: goals.length === 0 && stranded.length === 0
@@ -1394,14 +1590,17 @@ export default function (pi: ExtensionAPI) {
 		parameters: TeamRecallParams,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			await resolveDbPath(pi, ctx);
 			const cfg = edenConfig(ctx, params.workspace);
 			if (!cfg.orgId) return failMissingOrg("team_recall");
 			// Surface any steering queued for this role before the match list.
-			const steerLines = await consumePendingSteers(pi, ctx, cfg, params.agent_id, signal);
+			// team_recall carries no goal_id param, so only unscoped steers deliver here.
+			const steerLines = await consumePendingSteers(pi, ctx, cfg, params.agent_id, undefined, signal);
 			const limit = params.limit ?? 10;
 			const res = await pi.exec(
 				cfg.bin,
 				[
+					"--db", cfg.db,
 					"recall",
 					"--agent-id", params.agent_id,
 					"--user-id", cfg.userId,
@@ -1409,7 +1608,6 @@ export default function (pi: ExtensionAPI) {
 					"--workspace-id", cfg.workspaceId,
 					"--query", params.query,
 					"--limit", String(limit),
-					"--include-content",
 				],
 				{ signal, timeout: 30000 },
 			);
@@ -1426,7 +1624,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const ws = `workspace ${cfg.workspaceId} (${cfg.workspaceSource})`;
+			const ws = `workspace ${cfg.workspaceId} (${cfg.workspaceSource})${dbHint(cfg)}`;
 			// A CLI error is not "no matches" (no silent empty results).
 			const text = res.code !== 0
 				? `team_recall failed on ${ws}: ${res.stderr?.trim() || `eden-memory exited ${res.code}`}`
@@ -1525,11 +1723,13 @@ export default function (pi: ExtensionAPI) {
 		parameters: TeamRememberParams,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			await resolveDbPath(pi, ctx);
 			const cfg = edenConfig(ctx, params.workspace);
 			if (!cfg.orgId) return failMissingOrg("team_remember");
 			// Surface any steering queued for this role — the steer lands in the
 			// child's own transcript via this tool result (plain sight, no polling).
-			const steerLines = await consumePendingSteers(pi, ctx, cfg, params.agent_id, signal);
+			// Goal-scoped: deliver only steers aimed at this call's goal (plus unscoped).
+			const steerLines = await consumePendingSteers(pi, ctx, cfg, params.agent_id, params.goal_id, signal);
 			// Identity line for human/recall searchability. The canonical record
 			// id is the memory row id (returned by the CLI); there is no update
 			// subcommand to backfill it into content, so it is not embedded here.
@@ -1548,6 +1748,7 @@ export default function (pi: ExtensionAPI) {
 			const res = await pi.exec(
 				cfg.bin,
 				[
+					"--db", cfg.db,
 					"remember",
 					"--agent-id", params.agent_id,
 					"--user-id", cfg.userId,
@@ -1640,17 +1841,18 @@ export default function (pi: ExtensionAPI) {
 		parameters: TeamLookupParams,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			await resolveDbPath(pi, ctx);
 			const cfg = edenConfig(ctx, params.workspace);
 			if (!cfg.orgId) return failMissingOrg("team_lookup");
 			const res = await pi.exec(
 				cfg.bin,
 				[
+					"--db", cfg.db,
 					"lookup",
 					"--user-id", cfg.userId,
 					"--org-id", cfg.orgId,
 					"--workspace-id", cfg.workspaceId,
 					"--id", params.id,
-					"--include-content",
 				],
 				{ signal, timeout: 15000 },
 			);
@@ -1669,7 +1871,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const ws = `workspace ${cfg.workspaceId} (${cfg.workspaceSource})`;
+			const ws = `workspace ${cfg.workspaceId} (${cfg.workspaceSource})${dbHint(cfg)}`;
 			// Human/LLM-readable record card — no raw JSON dumps.
 			const text = res.code !== 0
 				? `team_lookup failed on ${ws}: ${res.stderr?.trim() || `eden-memory exited ${res.code}`}`
@@ -1787,6 +1989,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: TeamDecideParams,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			await resolveDbPath(pi, ctx);
 			const cfg = edenConfig(ctx, params.workspace);
 			if (!cfg.orgId) return failMissingOrg("team_decide");
 			const { goals, records } = await fetchGoals(
@@ -1823,6 +2026,7 @@ export default function (pi: ExtensionAPI) {
 			const res = await pi.exec(
 				cfg.bin,
 				[
+					"--db", cfg.db,
 					"remember",
 					"--agent-id", "dispatcher",
 					"--user-id", cfg.userId,
@@ -1958,7 +2162,7 @@ export default function (pi: ExtensionAPI) {
 				workspace: params.workspace,
 			});
 			const text = res.ok
-				? `Steer queued for ${params.role}${params.goal_id ? ` (goal ${shortId(params.goal_id, 8)})` : ""} — lands at the role's next team_* call.`
+				? `Steer queued for ${params.role}${params.goal_id ? ` (goal ${displayGoal(params.goal_id)})` : ""} — lands at the role's next team_* call.`
 				: `Failed to queue steer: ${res.error}`;
 			void renderWidget(pi, ctx);
 			return {
@@ -2056,15 +2260,23 @@ export default function (pi: ExtensionAPI) {
 			let goalId = "";
 			let roleIdx = 0;
 			if (!TEAM_ROLES.includes(tokens[0])) {
-				const first = tokens[0];
-				const match = goals.find(
-					(g) => displayGoal(g.goalId) === first || g.goalId.startsWith(first) || displayGoal(g.goalId).startsWith(first),
+				const first = tokens[0].toLowerCase();
+				const matches = goals.filter(
+					(g) => g.goalId.toLowerCase().startsWith(first) || displayGoal(g.goalId).toLowerCase().startsWith(first),
 				);
-				if (!match) {
+				if (matches.length === 0) {
 					ctx.ui.notify(`/steer: '${first}' is not a role (${TEAM_ROLES.join(", ")}) or a known goal id`, "error");
 					return;
 				}
-				goalId = match.goalId;
+				if (matches.length > 1) {
+					// Refuse ambiguous prefixes — never silently pick the first match.
+					ctx.ui.notify(
+						`/steer: '${first}' matches multiple goals (${matches.map((g) => displayGoal(g.goalId)).join(", ")}) — type more of the goal id`,
+						"error",
+					);
+					return;
+				}
+				goalId = matches[0]!.goalId;
 				roleIdx = 1;
 			}
 			const role = tokens[roleIdx];
@@ -2127,3 +2339,4 @@ export default function (pi: ExtensionAPI) {
 		cachedWorkspace = undefined;
 	});
 }
+
