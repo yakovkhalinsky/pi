@@ -13,7 +13,7 @@ configuration on another macOS/Linux machine from a clean clone.
 | `agent/agents/` | ATP role definitions (archivist, builder, dispatcher, researcher, router, runtime, verifier). |
 | `agent/prompts/` | Team prompt templates (team-charter, team-continue, team-escalate, team-handoff, team-status, team). |
 | `agent/extensions/` | Extension source (agentic-team-protocol, web-search-pretty). |
-| `agent/skills/` | Skills (agentic-team-protocol: README, CHARTER, SKILL, eden.sh). |
+| `agent/skills/` | Skills (agentic-team-protocol: README, CHARTER, SKILL, eden.sh, BENCHMARK). |
 | `tests/` | ATP test suite — repo-only, never installed into `~/.pi` (see "Running the tests"). |
 | `agent/settings.json` | Safe prefs only (theme, defaultModel, defaultProvider, compaction, packages) — **no secrets**. |
 | `agent/pi-pretty.json` | pi-pretty extension config (icons, tool rendering opts) — safe prefs. |

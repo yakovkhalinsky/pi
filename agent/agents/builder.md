@@ -71,7 +71,7 @@ Before finishing and returning the required durable record:
 3. Produce or load a plan. If the plan is written or updated to a file, record its absolute path as `plan_file_path` in the action record metadata. Do not begin implementation without a durable, visible plan.
 4. Check the current git branch. If you are on the project default branch (usually `master` or `main`) and the change is non-trivial, create a feature branch from the current state with a descriptive name (e.g., `feat/<goal-or-feature>`) and do all implementation work on that branch. Only trivial one-line fixes may be committed directly to the default branch.
 5. Implement the artefact using write/edit/bash as appropriate.
-6. Write periodic `run_log` records at natural boundaries (before/after a large edit, before a long command, before a hand-off) so `/team-continue` can resume if interrupted.
+6. Write `run_log` checkpoints at natural boundaries during LONG mutations (before/after a large edit, before a long command) so `/team-continue` can resume if interrupted. The turn-end record is the hand-off itself — do not write a separate turn-end run_log.
 7. If a step requires explicit user authorisation beyond the project charter (e.g., deleting a public release, modifying fleet-wide CI secrets), store a `pending_authorisation` record with the exact question and the prepared action, then stop and ask the user. Routine repository commit/push is not a `pending_authorisation` step; it is executed by Runtime after a green Verifier verdict.
 8. Write a change summary and store it in Eden-memory.
 9. Write a durable `hand_off_record` and return to the parent assistant.

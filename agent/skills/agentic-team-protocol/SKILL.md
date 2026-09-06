@@ -17,7 +17,7 @@ This is the **pi** port of the Agentic Team Protocol (https://yakov.khalinsky.co
 - **TUI tools (preferred over raw bash):** the `agentic-team-protocol` extension (`~/.pi/agent/extensions/agentic-team-protocol/index.ts`) registers `team_status`, `team_recall`, `team_remember`, `team_lookup`, and `team_decide` tools that wrap the same Eden-memory CLI and render themed TUI output (state-pill tables, scored match lists, confirmation/record cards, decision cards). Role subagents and the parent assistant should call these tools instead of `bash` + `eden.sh` for ATP memory I/O so the tool-call output is rich and auditable. The `/team-board` command renders a full-width bordered goal board; `/team-approve` is the human-decision flow for `pending_authorisation`/`blocked` goals. If the extension is not loaded, fall back to `bash` + `eden.sh`.
 - **Project opt-in** uses `.pi/agentic-team-charter.md` (and optionally `.pi/agentic-team-config.yaml`). Falls back to `.cursor/` or `.claude/` charter paths if a project was opted in for another harness.
 - **Flat delegation:** on pi the router does NOT spawn the next role. Roles return a routing decision to the parent assistant, and the parent assistant spawns the chosen role via the `subagent` tool. This keeps a single level of subagent nesting.
-- After a role subagent returns, immediately spawn `router` (or invoke `/team-continue ${GOAL_ID}`). Do not ask "Shall I proceed?" except when the latest record is `blocked`, `pending_authorisation`, or an `escalation_record`.
+- After a role subagent returns, continue the goal immediately without asking — normally via the **router fast-path** (spawn the hand-off's named next role directly; see "Automatic continuation"). Spawn `router` (or invoke `/team-continue ${GOAL_ID}`) only when the fast-path conditions are not met. Do not ask "Shall I proceed?" except when the latest record is `blocked`, `pending_authorisation`, or an `escalation_record`.
 
 A role-based agent team protocol implemented as pi primitives (subagent extension, agents, prompt-template commands, a skill) with Eden-memory as the single source of truth for state, ownership, and auditability.
 
@@ -25,7 +25,7 @@ A role-based agent team protocol implemented as pi primitives (subagent extensio
 
 - Subagent extension: `pi-submarine` (`npm:pi-submarine`, registered in `~/.pi/agent/settings.json`). Registers `subagent` (`{ agent?, task, model?, thinkingLevel?, context?, cwd? }`), `subagent_resume`, and `subagent_list`. Fresh child sessions run under the parent session's `.subagents/` directory with a tail-able `.jsonl.subagents.md` activity log.
 - Role agents: `~/.pi/agent/agents/{dispatcher,researcher,builder,runtime,verifier,archivist,router}.md`.
-- Skill + helper + charter: `~/.pi/agent/skills/agentic-team-protocol/{SKILL.md,eden.sh,CHARTER.md}`.
+- Skill + helper + charter + benchmark: `~/.pi/agent/skills/agentic-team-protocol/{SKILL.md,eden.sh,CHARTER.md,BENCHMARK.md}`.
 - Commands: `~/.pi/agent/prompts/{team,team-charter,team-status,team-escalate,team-continue,team-handoff}.md`.
 - Eden-memory CLI on PATH (verified). Identity is config-driven, never hardcoded in the source: `EDEN_ORG_ID` (and `EDEN_USER_ID`) resolve from the environment or `~/.eden-memory/.env`; override per project with the env var. Sourcing `eden.sh` always checks for unset config: in an interactive terminal it walks the user through setup and persists to `~/.eden-memory/.env`; in agent bash blocks (no TTY) it fails loudly with the exact fix — surface it to the user and stop rather than proceeding. `install.sh` runs the same check at the end of setup.
 
@@ -33,7 +33,7 @@ Restart pi (new session) so the subagent extension, agents, skills, and prompt t
 
 ## Live team UI (plain sight — no commands needed)
 
-- **Goal-board widget.** While a team runs, a widget above the editor always shows: the goal board (state/stage/owner per goal; while a hand-off is in flight the owner column shows the incoming role as `→ role` — roles write their stage record at the END of their work, so the handing-off role would otherwise own the board until the next role finishes), **running agents attached as activity lines under the goal they are working** (`  ● → edit runner.ts · 14 turns · 6m` — the role name is the goal row's OWNER column and is not repeated; nested child runs indent with `↳`; ambiguous matches render standalone with the role name), and the needs-you list + queued steers. Finished agent runs are dropped — the board's goal rows carry terminal state. It updates from subagent run events plus a 2s poller over the session's `.subagents/manifest.jsonl` and child session transcripts; the footer status line summarizes `ATP <n> active · <m> pending`.
+- **Goal-board widget.** While a team runs, a widget above the editor always shows: the goal board (state/stage/owner per goal; while a hand-off is in flight the owner column shows the incoming role as `→ role` — roles write their stage record at the END of their work, so the handing-off role would otherwise own the board until the next role finishes), **running agents attached as activity lines under the goal they are working** (`  ● → edit runner.ts · 14 turns · 6m` — the role name is the goal row's OWNER column and is not repeated; nested child runs indent with `↳`; ambiguous matches render standalone with the role name), and the needs-you list + queued steers. Finished agent runs are dropped — the board's goal rows carry terminal state. It updates from subagent run events plus a 1s poller over the session's `.subagents/manifest.jsonl` and child session transcripts; the footer status line summarizes `ATP <n> active · <m> pending`.
 - **Steering a running role.** `/steer [goal-id] <role> <message>` (user) or the `team_steer` tool (orchestrator) queues a `steer_request` record in Eden-memory. The role consumes it at its next `team_*` call — the message appears as `⚠ STEERING for <role>:` in the role's own transcript. `steer_request` records are control messages and never affect goal state.
 - **Hard interrupt.** Esc aborts the parent turn and the child with it; continue the child with `subagent_resume`. Prefer `team_steer` for mid-run redirection.
 
@@ -103,22 +103,37 @@ A forget is a deletion of durable memory. Scope mistakes here are the most destr
 
 ## Automatic continuation within a session
 
-After any role subagent writes its durable stage record and `hand_off_record` and returns to the parent assistant, the parent assistant must immediately continue the goal without asking the user. The parent must spawn the `router` subagent (or invoke `/team-continue ${GOAL_ID}`) so the router can read the latest Eden-memory records, determine the next required stage and role, and return the routing decision; the parent then spawns the chosen role.
+After any role subagent writes its durable stage record and `hand_off_record` and returns to the parent assistant, the parent assistant must immediately continue the goal without asking the user. Do not ask "Shall I proceed?" between normal lifecycle transitions.
+
+### Router fast-path (default)
+
+A full router pass costs ~80s of subagent time per transition and adds no information when the finishing role's hand-off is unambiguous. The parent therefore spawns the next role directly when ALL of these hold:
+
+1. The latest record for the `goal_id` is that role's `hand_off_record` (or stage record) naming a valid `next_role` (one of the seven ATP roles).
+2. The goal state is not `blocked`, `pending_authorisation`, or an escalation.
+3. The hand-off carries success criteria/deadline (the standard hand-off payload) so the receiving role can rehydrate from Eden-memory — the receiving role re-calls goal state at its own turn start regardless.
+
+When the fast-path applies, the parent spawns the named role via the `subagent` tool with the goal context and the hand-off record ID. The board's `→ role` column already reflects this activation.
+
+### Router mandatory (slow path)
+
+Spawn the `router` subagent (or invoke `/team-continue ${GOAL_ID}`) when:
+
+- the goal is `blocked`, `pending_authorisation`, or needs an escalation decision;
+- a `verdict` is red (rework routing);
+- the latest record does NOT name a valid `next_role` (ambiguous hand-off, interrupted work, dangling run_logs);
+- a role failed to produce its expected downstream record (recovery);
+- the goal is being continued in a fresh session from stale context.
 
 The parent assistant must not ask "Shall I proceed?" or otherwise wait for user confirmation between normal lifecycle transitions.
 
-Exceptions — pause and surface the situation to the user instead of auto-continuing only when the latest durable record indicates:
-
-- `blocked` — waiting on an external dependency or authority.
-- `pending_authorisation` — waiting on explicit user approval for a specific action.
-- An explicit escalation is required (e.g., low confidence, missed deadline, or charter conflict).
-
 ### Parent assistant continuation checklist
 
-1. Read the latest Eden-memory record for the `goal_id`.
+1. Read the latest Eden-memory record for the `goal_id` (cheap status read).
 2. If it is `blocked`, `pending_authorisation`, or an `escalation_record`, stop and surface the situation to the user. Offer `/team-approve` (or the `team_decide` tool) for the decision; do not decide unilaterally.
-3. Otherwise, immediately spawn the `router` subagent or invoke `/team-continue ${GOAL_ID}`.
-4. Do not ask "Shall I proceed?" between normal lifecycle transitions.
+3. If it names a valid `next_role` (router fast-path conditions met), spawn that role directly.
+4. Otherwise spawn the `router` subagent or invoke `/team-continue ${GOAL_ID}`.
+5. Do not ask "Shall I proceed?" between normal lifecycle transitions.
 
 For cross-session or cross-role transfers, the transferring role (or the Router when continuing) must also write a `hand_off_record`.
 
@@ -140,7 +155,7 @@ Every hand-off must include:
 
 ### Router obligation
 
-When the Router decides the next role, it must first write a durable hand-off record (a `hand_off_record` or a continuation `run_log` with the full hand-off payload). This record is the activation signal that lets the receiving role recall the goal without depending on conversation context. On pi the router then returns the decision to the parent, which spawns the next role. If the spawned role fails to produce its expected downstream record, the Router (on a later `/team-continue`) writes a recovery record and reports the missing hand-off to the user.
+Under the router fast-path the router is spawned only on the slow path (recovery, rework, ambiguity, escalation, fresh-session continuation) — in a healthy goal the finishing role's hand-off already names the next role. When the Router does run and decides the next role, it must first write a durable hand-off record (a `hand_off_record` or a continuation `run_log` with the full hand-off payload). This record is the activation signal that lets the receiving role recall the goal without depending on conversation context. On pi the router then returns the decision to the parent, which spawns the next role. If the spawned role fails to produce its expected downstream record, the Router (on a later `/team-continue`) writes a recovery record and reports the missing hand-off to the user.
 
 ## Eden-memory record schema
 
@@ -206,7 +221,7 @@ Required record types:
 - **Verifiability gap** — Verifier gate is mandatory before closure.
 - **Archivist as secretary** — Archivist owns linking and skill/runbook updates.
 - **Memory blindness** — Eden-memory is the single source of truth; do not rely on conversation context.
-- **Dropped interrupted work (F6a)** — every role turn ends with a `run_log` (or a final stage record) so `/team-continue` can resume; a `run_log` left dangling `in_progress` from an interrupted turn must be closed or superseded at the start of the next turn or continuation.
+- **Dropped interrupted work (F6a)** — every role turn ends with a durable turn-end signal: normally the `hand_off_record` (or the stage record when no hand-off follows), which supersedes the separate turn-end `run_log`. A turn-START `run_log` is still required (interrupted-work detection); a run_log left dangling `in_progress` from an interrupted turn must be closed or superseded at the start of the next turn or continuation.
 - **Scope-wide cleanup forgets (F1)** — never base a record cleanup on a shared scope (`agent_id`, workspace). A `cleanup_record` may only forget ids it explicitly owns (its own `output_record_ids`), verified per-id beforehand; see Cleanup-record discipline.
 - **Untracked global-file edits (F5b)** — any edit a role makes to global protocol files (`SKILL.md`, `agents/*.md`, `eden.sh`, `extensions/*`, or other files under `~/.pi/agent/`) during a goal must be listed in that goal's `action_record`/`archival_record` with file paths and the reason for the edit. Live-editing shared protocol files without a durable record hides side effects from the Verifier and the audit trail.
 - **Implicit hand-offs** — transfer ownership through a promoted `hand_off_record`, not chat history. The Router must write this record before returning its decision.

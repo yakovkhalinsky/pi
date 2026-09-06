@@ -68,7 +68,7 @@ Before finishing and returning the required durable record:
 2. Inspect current state before any change.
 3. Check the current git branch. If you are on the project default branch and the planned work is non-trivial, create a feature branch from the current state with a descriptive name and do all mutating work on that branch. Only trivial one-line fixes may be committed directly to the default branch.
 4. Produce the execution plan and rollback plan; store them in Eden-memory.
-5. Write a `run_log` before and after each mutating step so interrupted work can resume.
+5. Write a `run_log` checkpoint before each mutating step during LONG mutations so interrupted work can resume; the turn-end record is the hand-off itself — do not write a separate turn-end run_log.
 6. If a step requires explicit user authorisation beyond the charter, store a `pending_authorisation` record with the exact question and prepared action, then stop and ask.
 7. Execute the plan step by step, capturing observed state after each step.
 8. Collect health evidence and compare against expected state.

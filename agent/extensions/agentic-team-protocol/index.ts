@@ -159,7 +159,7 @@ let cachedWorkspace: string | undefined;
 // Data sources (no core changes, mirrors pi-submarine's on-disk artifacts):
 //   - <sessionFile>.subagents/manifest.jsonl — episode registry (started /
 //     finished / resume records with agent, sessionFile, parentEpisodeId).
-//     Tailed incrementally by a 2s poller while any run is active.
+//     Tailed incrementally by a 1s poller while any run is active.
 //   - child session .jsonl files — canonical transcripts, tailed for the
 //     current activity (last tool call / text) and turn counts.
 //   - `subagent`/`subagent_resume` tool_result details.run — authoritative
@@ -644,7 +644,7 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 	ctx.ui.setStatus("atp", status ? `Team ${status}` : undefined);
 }
 
-/** 2s poller: manifests + child tails + widget refresh while anything is live. */
+/** 1s poller: manifests + child tails + widget refresh while anything is live. */
 function startPoller(pi: ExtensionAPI): void {
 	if (pollTimer) return;
 	pollTimer = setInterval(() => {
@@ -671,7 +671,7 @@ function startPoller(pi: ExtensionAPI): void {
 				pollInFlight = false;
 			}
 		})();
-	}, 2000);
+	}, 1000);
 }
 
 function stopPoller(): void {

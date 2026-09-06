@@ -17,6 +17,8 @@ It exports `EDEN_MEMORY_BIN`, `USER_ID`, `EDEN_ORG_ID`, `WORKSPACE_ID` and defin
 
 **On pi the router does NOT spawn the next role.** Roles run as isolated pi subagent processes; to keep delegation flat, the router writes its durable `hand_off_record`/`run_log` and *returns* the routing decision to the parent assistant. The parent assistant then spawns the chosen role via the pi `subagent` tool with the goal context and the hand-off record ID. (This differs from the Cursor port, where the router spawned the next role itself.)
 
+**Router fast-path:** in a healthy goal the parent assistant spawns the hand-off's named next role DIRECTLY and skips the router (~80s saved per transition; see SKILL "Router fast-path"). The router is therefore spawned only on the slow path: recovery after interruption, rework after a red verdict, ambiguous hand-offs without a valid `next_role`, escalations, and fresh-session `/team-continue`. Don't treat a skipped router pass as an error.
+
 ## Obligation
 
 Resume interrupted or unfinished goals by reading Eden-memory and deciding the correct next role. The router is the controller the protocol assumes: local harness context is disposable, so all continuation happens through durable Eden records.
