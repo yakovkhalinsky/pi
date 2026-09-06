@@ -44,11 +44,14 @@
  *   On every `subagent` tool_result, a compact goal board is refreshed as a
  *   widget above the editor so the user sees team state update live, without
  *   restyling the (headless) subagent's internal tool calls.
- *   A mid-flight hand_off_record's `next_role` (known protocol roles only)
- *   renders as the goal's incoming owner (`→ researcher`) until the target
- *   role writes its first record: roles write stage records at the END of
- *   their work, so the handing-off role would otherwise own the board for
- *   the whole duration of the next stage.
+ *   Running agents attach to the goal they are working (role == owner or the
+ *   incoming next_owner) as indented activity lines under that goal row —
+ *   the role name is the board's OWNER column, so it is not repeated:
+ *   `  ● → edit runner.ts · 14 turns · 6m`. Goalless/ambiguous running agents
+ *   render as standalone rows; finished runs are dropped (the board's goal
+ *   row carries terminal state). A mid-flight hand_off_record's `next_role`
+ *   (known protocol roles only) renders as the goal's incoming owner
+ *   (`→ researcher`) until the target role writes its first record.
  *
  * Human-readable output (2026-09-04):
  *   - team_lookup's text output is a readable record card, not a JSON dump.
@@ -525,7 +528,46 @@ function themelessSteerLine(goalId: string, role: string, message: string): stri
 	return `⚠ STEERING for ${role}${goalId ? ` (goal ${displayGoal(goalId)})` : ""}: ${message}`;
 }
 
-/** Compose the always-visible widget: goal board + live subagent rows + needs-you + steer queue. */
+/**
+ * Activity line for a running agent attached to its goal row: the role name is
+ * already the goal's OWNER column, so it is not repeated — the line carries
+ * only status dot, activity, turns, and elapsed. Nested children indent under
+ * their parent run.
+ */
+function formatGoalActivityLine(theme: Theme, row: SubagentRow, isChild: boolean): string {
+	const elapsed = fmtElapsed((row.finishedAt ?? Date.now()) - row.startedAt);
+	const body = `${row.lastActivity || "working"} ${theme.fg("dim", `· ${row.turns} turns · ${elapsed}`)}`;
+	if (isChild) return `    ${theme.fg("dim", "↳ ")}${theme.fg("muted", body)}`;
+	return `  ${theme.fg("success", "●")} ${theme.fg("muted", body)}`;
+}
+
+/**
+ * Attach running agent rows to the goal they are working (role == owner or the
+ * incoming nextOwner, goal not closed). A role running on exactly one goal
+ * attaches there; ambiguous matches (same role owning several active goals)
+ * stay standalone so the line never silently binds to the wrong goal.
+ */
+function associateRunningRows(
+	goals: GoalSummary[],
+	rows: SubagentRow[],
+): { attached: Map<string, SubagentRow[]>; loose: SubagentRow[] } {
+	const attached = new Map<string, SubagentRow[]>();
+	const loose: SubagentRow[] = [];
+	for (const r of rows) {
+		const cands = goals.filter((g) => g.state !== "closed" && (g.owner === r.agent || g.nextOwner === r.agent));
+		if (cands.length === 1) {
+			const k = cands[0]!.goalId;
+			const arr = attached.get(k) ?? [];
+			arr.push(r);
+			attached.set(k, arr);
+		} else {
+			loose.push(r);
+		}
+	}
+	return { attached, loose };
+}
+
+/** Compose the always-visible widget: goal board + attached live agent activity + needs-you + steers. */
 async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined): Promise<void> {
 	if (!ctx || ctx.mode !== "tui" || !ctx.hasUI) return;
 	const cfg = edenConfig(ctx);
@@ -534,17 +576,44 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 	const { goals, records } = await fetchGoals(pi, ctx, undefined, {});
 	const steers = await fetchSteers(pi, ctx);
 
+	// Only running runs render: terminal state lives on the board's goal rows,
+	// so lingering "✓ completed" agent rows under the board are pure duplication.
+	const running = sortedSubagentRows().filter((r) => r.status === "running");
+	const { attached, loose } = associateRunningRows(goals, running);
+
 	const lines: string[] = [theme.fg("accent", theme.bold(" Goal Board"))];
+	let budget = 6; // total live-agent activity lines on the widget
+	let rendered = 0;
 	if (goals.length > 0) {
 		lines.push(boardHeader(theme, true));
-		for (const g of goals) lines.push(boardRow(theme, g, true));
+		for (const g of goals) {
+			lines.push(boardRow(theme, g, true));
+			const runs = attached.get(g.goalId) ?? [];
+			for (const r of runs) {
+				const isChild = r.parentEpisodeId != null && runs.some((p) => p.episodeId === r.parentEpisodeId);
+				if (budget-- > 0) {
+					rendered++;
+					lines.push(formatGoalActivityLine(theme, r, isChild));
+				}
+			}
+		}
 	}
-	const rows = sortedSubagentRows();
-	if (rows.length > 0) {
-		if (goals.length > 0) lines.push("");
-		for (const r of rows.slice(0, 6)) lines.push(formatSubagentRow(theme, r));
-		if (rows.length > 6) lines.push(theme.fg("dim", ` …+${rows.length - 6} more subagent runs`));
+	if (loose.length > 0) {
+		let blankPushed = false;
+		for (const r of loose) {
+			if (budget-- > 0) {
+				if (!blankPushed && goals.length > 0) {
+					lines.push("");
+					blankPushed = true;
+				}
+				rendered++;
+				lines.push(formatSubagentRow(theme, r));
+			}
+		}
 	}
+	const hidden = running.length - rendered;
+	if (hidden > 0) lines.push(theme.fg("dim", ` …+${hidden} more running agent${hidden === 1 ? "" : "s"}`));
+
 	const stranded = findStrandedPending(records, goals);
 	const needsYou = needsYouRows(theme, goals, stranded);
 	if (needsYou.length > 0) {
@@ -562,14 +631,14 @@ async function renderWidget(pi: ExtensionAPI, ctx: ExtensionContext | undefined)
 		}
 	}
 
-	if (goals.length === 0 && rows.length === 0 && steers.length === 0) {
+	if (goals.length === 0 && running.length === 0 && steers.length === 0) {
 		ctx.ui.setWidget("atp-board", undefined);
 		ctx.ui.setStatus("atp", undefined);
 		return;
 	}
 	ctx.ui.setWidget("atp-board", lines);
 
-	const activeCount = rows.filter((r) => r.status === "running").length;
+	const activeCount = running.length;
 	const pendingCount = goals.filter((g) => g.state === "pending_authorisation" || g.state === "blocked").length + stranded.length;
 	const status = [activeCount > 0 ? `${activeCount} active` : "", pendingCount > 0 ? `${pendingCount} pending` : ""].filter(Boolean).join(" · ");
 	ctx.ui.setStatus("atp", status ? `Team ${status}` : undefined);
@@ -2417,6 +2486,8 @@ export {
 	fmtElapsed,
 	sortedSubagentRows,
 	formatSubagentRow,
+	formatGoalActivityLine,
+	associateRunningRows,
 	themelessSteerLine,
 	renderWidget,
 	// steer delivery (scope C8)

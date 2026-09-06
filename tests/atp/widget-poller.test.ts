@@ -237,3 +237,169 @@ describe("C7-1: renderWidget composes board + agent rows + needs-you + steers + 
 		}
 	});
 });
+
+describe("C7-1b: running agents attach to their goal (de-duplicated agent UI)", () => {
+	const { binPath, dispose: disposeBin } = installFixtureBin();
+	after(() => disposeBin());
+
+	function seedRunning(dir: string, episodeId: string, agent: string, activity: string, opts: { sessionFile?: string; parentEpisodeId?: string } = {}) {
+		const manifest = join(dir, "m.jsonl");
+		appendFileSync(
+			manifest,
+			JSON.stringify({ type: "started", episodeId, agent, sessionFile: opts.sessionFile, parentEpisodeId: opts.parentEpisodeId, startedAt: new Date(Date.now() - 6 * 60_000).toISOString() }) + "\n",
+		);
+		mod.pollManifest(manifest);
+		if (opts.sessionFile) {
+			writeFileSync(opts.sessionFile, JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: activity.replace("→ ", "") }] } }) + "\n");
+			mod.pollChildSessions();
+		}
+	}
+
+	it("attaches a running agent under its goal as a name-free activity line", async () => {
+		const db = createFixtureDb([
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "goal_record", stage: "goal_receipt", owner: "dispatcher", body: '{"title":"Attach Goal"}', createdAt: 1_760_000_001 }),
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "action_record", stage: "action", owner: "builder", status: "in_progress", createdAt: 1_760_000_002 }),
+		]);
+		const { pi } = await loadExtension();
+		const dir = mkdtempSync(join(tmpdir(), "atp-attach-"));
+		try {
+			seedRunning(dir, "ep-att", "builder", "→ edit", { sessionFile: join(dir, "c.jsonl") });
+			await withEnv(testEnv({ EDEN_MEMORY_DB: db.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const lines = (captured.setWidget["atp-board"] ?? []).map(strip);
+				const joined = lines.join("\n");
+				assert.ok(joined.includes("Attach Goal"), "goal row");
+				assert.ok(joined.includes("  ● → edit · 1 turns · 6m"), "attached activity line, no role name");
+				assert.ok(!joined.includes("● builder"), "role name not repeated under its own goal row");
+				assert.equal(captured.setStatus["atp"], "Team 1 active");
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			db.dispose();
+			pi.__emit("session_shutdown");
+		}
+	});
+
+	it("in-flight hand-off: the incoming role's agent attaches under nextOwner", async () => {
+		// mid-flight hand-off WITHOUT archival: goal stays continueable, nextOwner shows
+		const db = createFixtureDb([
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "goal_record", stage: "goal_receipt", owner: "dispatcher", createdAt: 1_760_000_001 }),
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "action_record", stage: "context_gathering", owner: "researcher", status: "completed", createdAt: 1_760_000_002 }),
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "hand_off_record", stage: "hand_off_or_closure", owner: "researcher", createdAt: 1_760_000_003, metadata: { next_role: "builder" } }),
+		]);
+		const { pi } = await loadExtension();
+		const dir = mkdtempSync(join(tmpdir(), "atp-nextown-"));
+		try {
+			seedRunning(dir, "ep-next", "builder", "→ edit", { sessionFile: join(dir, "c.jsonl") });
+			await withEnv(testEnv({ EDEN_MEMORY_DB: db.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const joined = (captured.setWidget["atp-board"] ?? []).map(strip).join("\n");
+				assert.ok(joined.includes("→ builder"), "board shows incoming owner");
+				assert.ok(joined.includes("  ● → edit"), "agent attaches under the goal it is taking over");
+				assert.ok(!joined.includes("● builder"), "no standalone duplicate");
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			db.dispose();
+			pi.__emit("session_shutdown");
+		}
+	});
+
+	it("finished runs are dropped — the board's goal row carries terminal state", async () => {
+		const db = createFixtureDb([
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "goal_record", stage: "goal_receipt", owner: "dispatcher", body: '{"title":"Done Goal"}', createdAt: 1_760_000_001 }),
+		]);
+		const { pi } = await loadExtension();
+		const dir = mkdtempSync(join(tmpdir(), "atp-fin-"));
+		try {
+			const manifest = join(dir, "m.jsonl");
+			writeFileSync(manifest, JSON.stringify({ type: "started", episodeId: "ep-fin", agent: "builder", startedAt: new Date().toISOString() }) + "\n");
+			mod.pollManifest(manifest);
+			appendFileSync(manifest, JSON.stringify({ type: "finished", episodeId: "ep-fin-x", status: "completed" }) + "\n");
+			writeFileSync(manifest, JSON.stringify({ type: "started", episodeId: "ep-fin", agent: "builder", startedAt: new Date().toISOString() }) + "\n" + JSON.stringify({ type: "finished", episodeId: "ep-fin", status: "completed", finishedAt: new Date().toISOString() }) + "\n");
+			mod.pollManifest(manifest);
+			await withEnv(testEnv({ EDEN_MEMORY_DB: db.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const joined = (captured.setWidget["atp-board"] ?? []).map(strip).join("\n");
+				assert.ok(joined.includes("Done Goal"), "board still renders");
+				assert.ok(!joined.includes("✓ builder"), "no terminal agent row under the board");
+				assert.ok(!joined.includes("completed"), "no completed agent line");
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			db.dispose();
+			pi.__emit("session_shutdown");
+		}
+	});
+
+	it("ambiguous role (same role owning several active goals) stays standalone with its name", async () => {
+		const goalB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+		const db = createFixtureDb([
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "action_record", owner: "builder", createdAt: 1_760_000_001 }),
+			fixtureRecord({ goalId: goalB, recordType: "action_record", owner: "builder", createdAt: 1_760_000_002 }),
+		]);
+		const { pi } = await loadExtension();
+		const dir = mkdtempSync(join(tmpdir(), "atp-ambig-"));
+		try {
+			seedRunning(dir, "ep-amb", "builder", "→ edit", { sessionFile: join(dir, "c.jsonl") });
+			await withEnv(testEnv({ EDEN_MEMORY_DB: db.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const joined = (captured.setWidget["atp-board"] ?? []).map(strip).join("\n");
+				assert.ok(joined.includes("● builder · → edit"), "standalone row keeps the role name (no silent binding)");
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			db.dispose();
+			pi.__emit("session_shutdown");
+		}
+	});
+
+	it("nested child runs indent under the parent's activity line", async () => {
+		const db = createFixtureDb([
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "action_record", owner: "builder", createdAt: 1_760_000_001 }),
+		]);
+		const { pi } = await loadExtension();
+		const dir = mkdtempSync(join(tmpdir(), "atp-nestw-"));
+		try {
+			seedRunning(dir, "ep-par", "builder", "→ edit", { sessionFile: join(dir, "p.jsonl") });
+			seedRunning(dir, "ep-chi", "builder", "→ bash", { sessionFile: join(dir, "c.jsonl"), parentEpisodeId: "ep-par" });
+			await withEnv(testEnv({ EDEN_MEMORY_DB: db.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const lines = (captured.setWidget["atp-board"] ?? []).map(strip);
+				const joined = lines.join("\n");
+				assert.ok(joined.includes("  ● → edit"), "parent activity line");
+				assert.ok(joined.includes("    ↳ → bash"), "child indented under parent");
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			db.dispose();
+			pi.__emit("session_shutdown");
+		}
+	});
+
+	it("more than 6 live agent lines collapse into an overflow note", async () => {
+		const db = createFixtureDb([
+			fixtureRecord({ goalId: TEST_GOAL, recordType: "action_record", owner: "builder", createdAt: 1_760_000_001 }),
+		]);
+		const { pi } = await loadExtension();
+		const dir = mkdtempSync(join(tmpdir(), "atp-budg-"));
+		try {
+			for (let i = 0; i < 7; i++) seedRunning(dir, `ep-b${i}`, `role${i}`, "→ tool");
+			await withEnv(testEnv({ EDEN_MEMORY_DB: db.dbPath, EDEN_MEMORY_BIN: binPath }), async () => {
+				const { ctx, captured } = createMockCtx();
+				await mod.renderWidget(pi, ctx);
+				const joined = (captured.setWidget["atp-board"] ?? []).map(strip).join("\n");
+				assert.ok(joined.includes("…+1 more running agent"), "overflow note");
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			db.dispose();
+			pi.__emit("session_shutdown");
+		}
+	});
+});
